@@ -28,7 +28,7 @@ classID, confidence, box coordinates
 
 \*\*What changes when the confidence threshold goes to 0.2 or 0.8?\*\*
 
-From 0.2, most bottles get detected. But, when the threshold is increased to 0.5 or 0.8, the detection flickers a lot and the bottle needs to be in the correct orientation, or position relative to the camera to be detected. 
+From 0.2, most bottles get detected. But, when the threshold is increased to 0.5 or 0.8, the detection flickers a lot and the bottle needs to be in the correct orientation, or position relative to the camera to be detected.
 
 
 
@@ -59,4 +59,38 @@ From 0.2, most bottles get detected. But, when the threshold is increased to 0.5
 
 
 \*\*Speed:\*\* about 88 ms per frame (\~11 FPS) with yolo26n on CPU
+
+
+
+\## Milestone 3
+
+\*\*Why bottom center?\*\*
+
+Its symmetrical, it's out of the way of the frame, and it's essentially where I am on the frame.
+
+
+
+\*\*What would moving the origin change about the target line?\*\*
+
+The line start and length would change if it was put somewhere else on the screen. It wouldn't change the detection, its just a different  reference point.  
+
+
+
+\*\*How OpenCV image coordinates work:\*\*
+
+0,0 is at the top left corner of the screen and x increases as it goes right and y increases as it goes down. 
+
+
+
+\*\*Crosshair position on my 640×480 frame:\*\*
+
+x = width//2 
+
+bottom margin is 40
+
+y = height - bottom margin
+
+coordinates: (320, 440)
+
+
 

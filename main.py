@@ -1,4 +1,4 @@
-"""Milestone 2: detect bottles in the live webcam feed with YOLO.
+"""Milestone 3: detect bottles with YOLO and mark a bottom-center origin.
 
 Press q (or close the window) to quit.
 """
@@ -20,6 +20,12 @@ TEXT_COLOR = (0, 0, 0)  # black text on the green label background
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 FONT_SCALE = 0.7
 FONT_THICKNESS = 2
+
+# Crosshair that marks the origin point (bottom center of the frame).
+CROSSHAIR_SIZE = 20  # length of each arm from the center, in pixels
+CROSSHAIR_COLOR = (0, 0, 255)  # red, so it stands out from the green box
+CROSSHAIR_THICKNESS = 2  # line thickness in pixels
+CROSSHAIR_BOTTOM_MARGIN = 40  # distance from the bottom edge (keep > SIZE)
 
 
 def draw_detection(frame, x1, y1, x2, y2, label):
@@ -46,6 +52,32 @@ def draw_detection(frame, x1, y1, x2, y2, label):
     # of the text, so move down by the text height plus padding.
     cv2.putText(frame, label, (x1 + 4, label_top + text_h + 4), FONT,
                 FONT_SCALE, TEXT_COLOR, FONT_THICKNESS)
+
+
+def get_origin(frame):
+    # frame.shape is (height, width, colors): rows first, then columns.
+    height, width = frame.shape[:2]
+
+    # Horizontal center. // is whole-number division (pixels are whole numbers).
+    x = width // 2
+
+    # y = 0 is the TOP of the image and grows downward, so subtracting from
+    # the height moves the point up from the bottom edge.
+    y = height - CROSSHAIR_BOTTOM_MARGIN
+
+    return (x, y)
+
+
+def draw_crosshair(frame, origin):
+    x, y = origin
+
+    # Horizontal arm: from left of the center to right of it.
+    cv2.line(frame, (x - CROSSHAIR_SIZE, y), (x + CROSSHAIR_SIZE, y),
+             CROSSHAIR_COLOR, CROSSHAIR_THICKNESS)
+
+    # Vertical arm: from above the center to below it.
+    cv2.line(frame, (x, y - CROSSHAIR_SIZE), (x, y + CROSSHAIR_SIZE),
+             CROSSHAIR_COLOR, CROSSHAIR_THICKNESS)
 
 
 def main():
@@ -112,6 +144,11 @@ def main():
                 # Label like "bottle, 0.75" (confidence to 2 decimal places).
                 label = f"{model.names[cls_id]}, {conf:.2f}"
                 draw_detection(frame, x1, y1, x2, y2, label)
+
+            # Draw the origin crosshair after detection (so YOLO only ever sees
+            # the clean frame) and last (so nothing else covers it).
+            origin = get_origin(frame)
+            draw_crosshair(frame, origin)
 
             # Hand the frame to the window. Nothing is drawn until waitKey runs.
             cv2.imshow(WINDOW_NAME, frame)
