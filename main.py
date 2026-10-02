@@ -1,9 +1,14 @@
-"""Milestone 3: detect bottles with YOLO and mark a bottom-center origin.
+"""Milestone 4: detect bottles with YOLO, mark a bottom-center origin, and
+calibrate the camera's focal length.
 
+Press c to calibrate (press c again to cancel).
 Press q (or close the window) to quit.
 """
 
+import json  # reading and writing calibration.json
 import sys  # used to exit the program with an error code
+from datetime import datetime  # timestamp saved with the calibration
+from pathlib import Path  # building file paths that work on any OS
 
 import cv2  # OpenCV: camera access, windows, and image drawing
 from ultralytics import YOLO  # Ultralytics: loads and runs YOLO models
@@ -26,6 +31,63 @@ CROSSHAIR_SIZE = 20  # length of each arm from the center, in pixels
 CROSSHAIR_COLOR = (0, 0, 255)  # red, so it stands out from the green box
 CROSSHAIR_THICKNESS = 2  # line thickness in pixels
 CROSSHAIR_BOTTOM_MARGIN = 40  # distance from the bottom edge (keep > SIZE)
+
+# Status text in the top-left corner.
+HUD_BG_COLOR = (0, 0, 0)  # black background
+HUD_TEXT_COLOR = (255, 255, 255)  # white text
+
+# Calibration.
+BOTTLE_HEIGHT_M = 0.142  # real height of the bottle, in meters
+KNOWN_DISTANCE_M = 1.00  # distance from the webcam lens to the bottle, in meters
+CALIBRATION_FRAMES = 30  # how many frames of h to average
+CALIBRATION_FILE = "calibration.json"
+EDGE_MARGIN = 5  # boxes this close (px) to the top/bottom edge may be cut off
+
+# Keep calibration.json next to main.py, no matter which folder we run from.
+CALIBRATION_PATH = Path(__file__).parent / CALIBRATION_FILE
+
+
+def compute_focal_length(h_px, known_distance_m, bottle_height_m):
+    """Return the camera's focal length in pixels.
+
+    h_px: the bottle's box height in the image, in pixels
+    known_distance_m: distance from the camera to the bottle, in meters
+    bottle_height_m: the bottle's real height, in meters
+    """
+    f = (h_px * known_distance_m) / bottle_height_m
+    return f
+
+
+def load_calibration():
+    # No file yet means the camera hasn't been calibrated.
+    if not CALIBRATION_PATH.exists():
+        return None
+
+    # If the file is broken (bad JSON, missing field, not a number), treat it
+    # as "not calibrated" instead of crashing.
+    try:
+        with open(CALIBRATION_PATH) as f:
+            data = json.load(f)
+        return float(data["focal_length_px"])
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        print(f"Warning: could not read {CALIBRATION_PATH}; press c to recalibrate.")
+        return None
+
+
+def save_calibration(focal_length, avg_h):
+    # Save the result together with the values used to get it, so the file
+    # explains itself later.
+    data = {
+        "focal_length_px": focal_length,
+        "avg_box_height_px": avg_h,
+        "known_distance_m": KNOWN_DISTANCE_M,
+        "bottle_height_m": BOTTLE_HEIGHT_M,
+        "frames_averaged": CALIBRATION_FRAMES,
+        "calibrated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    # indent=2 puts each field on its own line so it's easy to read.
+    with open(CALIBRATION_PATH, "w") as f:
+        json.dump(data, f, indent=2)
 
 
 def draw_detection(frame, x1, y1, x2, y2, label):
@@ -52,6 +114,21 @@ def draw_detection(frame, x1, y1, x2, y2, label):
     # of the text, so move down by the text height plus padding.
     cv2.putText(frame, label, (x1 + 4, label_top + text_h + 4), FONT,
                 FONT_SCALE, TEXT_COLOR, FONT_THICKNESS)
+
+
+def draw_hud_text(frame, text, line):
+    # Draw one line of status text in the top-left corner. line 0 is the top
+    # line, line 1 goes under it, and so on.
+    (text_w, text_h), baseline = cv2.getTextSize(text, FONT, FONT_SCALE,
+                                                 FONT_THICKNESS)
+    line_h = text_h + baseline + 8  # 8 px of padding
+    top = 10 + line * (line_h + 4)  # 10 px from the top, 4 px between lines
+
+    # Filled background, then the text on top of it (same idea as the label).
+    cv2.rectangle(frame, (10, top), (10 + text_w + 8, top + line_h),
+                  HUD_BG_COLOR, -1)
+    cv2.putText(frame, text, (14, top + text_h + 4), FONT, FONT_SCALE,
+                HUD_TEXT_COLOR, FONT_THICKNESS)
 
 
 def get_origin(frame):
@@ -96,6 +173,19 @@ def main():
         print(f"Error: the model has no class named '{TARGET_CLASS}'.")
         sys.exit(1)
 
+    # Load a saved focal length, or None if we haven't calibrated yet.
+    focal_length = load_calibration()
+    if focal_length is None:
+        print("Not calibrated yet. Hold the bottle at "
+              f"{KNOWN_DISTANCE_M:.2f} m and press c.")
+    else:
+        print(f"Loaded focal length: {focal_length:.1f} px")
+
+    # Calibration state.
+    calibrating = False  # True while we're collecting samples
+    samples = []  # box heights (h) collected so far
+    message = ""  # last calibration result or problem, shown on screen
+
     # Connect to the webcam. This returns a "capture" object we read frames from.
     cap = cv2.VideoCapture(CAMERA_INDEX)
 
@@ -106,7 +196,7 @@ def main():
         print("and that Windows camera privacy settings allow desktop apps.")
         sys.exit(1)  # exit code 1 means "something went wrong"
 
-    print("Webcam opened. Press q in the video window to quit.")
+    print("Webcam opened. Press c to calibrate, q to quit.")
 
     # try/finally makes sure the cleanup below runs no matter how the loop ends.
     try:
@@ -126,6 +216,9 @@ def main():
             # image; we gave it one image, so take the first.
             result = model(frame, conf=CONF_THRESHOLD, verbose=False)[0]
 
+            # Every bottle found in this frame, as (x1, y1, x2, y2, conf).
+            bottles = []
+
             # result.boxes holds one entry per detected object.
             for box in result.boxes:
                 # Class ID and confidence come back as tensors; int() and
@@ -140,10 +233,67 @@ def main():
                 # xyxy = top-left (x1, y1) and bottom-right (x2, y2) corners,
                 # in pixels of our frame. OpenCV needs whole numbers.
                 x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
+                bottles.append((x1, y1, x2, y2, conf))
 
                 # Label like "bottle, 0.75" (confidence to 2 decimal places).
                 label = f"{model.names[cls_id]}, {conf:.2f}"
                 draw_detection(frame, x1, y1, x2, y2, label)
+
+            # Live box height of the most confident bottle (index 4 is conf).
+            if bottles:
+                best = max(bottles, key=lambda b: b[4])
+                h_text = f"h: {best[3] - best[1]} px"  # h = y2 - y1
+            else:
+                h_text = "h: --"
+
+            # While calibrating, collect one h per frame, but only from frames
+            # we can trust.
+            if calibrating:
+                frame_height = frame.shape[0]
+
+                if len(bottles) == 0:
+                    status = "no bottle, waiting"
+                elif len(bottles) > 1:
+                    # Can't tell which box is the bottle at the known distance.
+                    status = f"{len(bottles)} bottles, waiting"
+                else:
+                    x1, y1, x2, y2, conf = bottles[0]
+                    # A box touching the top or bottom edge is probably cut off,
+                    # which would make h too small.
+                    if y1 <= EDGE_MARGIN or y2 >= frame_height - EDGE_MARGIN:
+                        status = "bottle at edge, waiting"
+                    else:
+                        samples.append(y2 - y1)
+                        status = "collecting"
+
+                # Enough samples: average them and compute the focal length.
+                if len(samples) >= CALIBRATION_FRAMES:
+                    calibrating = False
+                    avg_h = sum(samples) / len(samples)
+                    try:
+                        focal_length = compute_focal_length(
+                            avg_h, KNOWN_DISTANCE_M, BOTTLE_HEIGHT_M)
+                        save_calibration(focal_length, avg_h)
+                        message = f"Saved: avg h {avg_h:.1f} px"
+                        print(f"Calibrated: avg h = {avg_h:.1f} px, "
+                              f"focal length = {focal_length:.1f} px")
+                    except NotImplementedError:
+                        message = "compute_focal_length not implemented yet"
+                        print(f"Calibration: avg h = {avg_h:.1f} px, but "
+                              "compute_focal_length is not implemented yet.")
+                else:
+                    message = (f"Calibrating... {len(samples)}/"
+                               f"{CALIBRATION_FRAMES} ({status})")
+
+            # Status lines in the top-left corner.
+            draw_hud_text(frame, h_text, 0)
+            if focal_length is None:
+                draw_hud_text(frame, "Not calibrated: hold bottle at "
+                              f"{KNOWN_DISTANCE_M:.2f} m and press c", 1)
+            else:
+                draw_hud_text(frame, f"Focal length: {focal_length:.1f} px", 1)
+            if message:
+                draw_hud_text(frame, message, 2)
 
             # Draw the origin crosshair after detection (so YOLO only ever sees
             # the clean frame) and last (so nothing else covers it).
@@ -161,6 +311,16 @@ def main():
             # ord('q') is the key code for the letter q.
             if key == ord("q"):
                 break
+
+            # c starts calibration, or cancels it if it's already running.
+            if key == ord("c"):
+                if calibrating:
+                    calibrating = False
+                    message = "Calibration cancelled"
+                else:
+                    calibrating = True
+                    samples = []
+                    message = f"Calibrating... 0/{CALIBRATION_FRAMES}"
 
             # Stop if the user closed the window with the X button.
             if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:

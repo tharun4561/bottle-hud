@@ -72,25 +72,49 @@ Its symmetrical, it's out of the way of the frame, and it's essentially where I 
 
 \*\*What would moving the origin change about the target line?\*\*
 
-The line start and length would change if it was put somewhere else on the screen. It wouldn't change the detection, its just a different  reference point.  
+The line start and length would change if it was put somewhere else on the screen. It wouldn't change the detection, its just a different  reference point.
 
 
 
 \*\*How OpenCV image coordinates work:\*\*
 
-0,0 is at the top left corner of the screen and x increases as it goes right and y increases as it goes down. 
+0,0 is at the top left corner of the screen and x increases as it goes right and y increases as it goes down.
 
 
 
 \*\*Crosshair position on my 640×480 frame:\*\*
 
-x = width//2 
+x = width//2
 
 bottom margin is 40
 
 y = height - bottom margin
 
 coordinates: (320, 440)
+
+
+
+
+
+\## Milestone 4
+
+\*\*Why does calibration only need to happen once per camera?\*\*
+
+The camera's focal length doesn't change, so calibrating once is enough. 
+
+
+
+\*\*What if the bottle is tilted?\*\*
+
+The pixel height will change, so the accuracy will decrease, giving the wrong focal length
+
+
+
+\*\*My calibration:\*\*
+
+\- H = 0.142 m, D = 1.00 m, averaged h = \~87.4 px → f = 615.3 px
+
+
 
 
 
