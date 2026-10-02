@@ -100,7 +100,7 @@ coordinates: (320, 440)
 
 \*\*Why does calibration only need to happen once per camera?\*\*
 
-The camera's focal length doesn't change, so calibrating once is enough. 
+The camera's focal length doesn't change, so calibrating once is enough.
 
 
 
@@ -115,6 +115,24 @@ The pixel height will change, so the accuracy will decrease, giving the wrong fo
 \- H = 0.142 m, D = 1.00 m, averaged h = \~87.4 px → f = 615.3 px
 
 
+
+\## Milestone 5
+
+\*\*Why does the distance jump when the bottle is partly off screen?\*\*
+
+It thinks that the clipped image of the object is just the object, but smaller. So, a smaller object means farther away.
+
+
+
+\*\*How could you smooth it?\*\*
+
+Options: 
+
+average last N values of h, 1 wrong value can make it inaccurate
+
+Exponential moving avg on h, lags
+
+median of last n values, less smooth 
 
 
 
