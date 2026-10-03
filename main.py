@@ -1,5 +1,6 @@
-"""Milestone 5: detect bottles with YOLO, mark a bottom-center origin,
-calibrate the camera's focal length, and show live distance and time to hit.
+"""Milestone 6: detect bottles with YOLO, mark a bottom-center origin,
+calibrate the camera's focal length, show live distance and time to hit,
+and draw a target line with horizontal and vertical bearing angles.
 
 Press c to calibrate (press c again to cancel).
 Press + / - to change the interceptor speed.
@@ -7,6 +8,7 @@ Press q (or close the window) to quit.
 """
 
 import json  # reading and writing calibration.json
+import math  # math functions for the bearing formula
 import sys  # used to exit the program with an error code
 from datetime import datetime  # timestamp saved with the calibration
 from pathlib import Path  # building file paths that work on any OS
@@ -19,7 +21,7 @@ WINDOW_NAME = "Bottle HUD"  # the title shown on the window
 
 MODEL_PATH = "yolo26n.pt"  # YOLO26 nano; downloaded automatically on first run
 TARGET_CLASS = "bottle"  # the only class we want to show
-CONF_THRESHOLD = 0.3  # hide detections the model is less sure about than this
+CONF_THRESHOLD = 0.2  # hide detections the model is less sure about than this
 BOX_COLOR = (0, 255, 0)  # green; OpenCV colors are (blue, green, red)
 TEXT_COLOR = (0, 0, 0)  # black text on the green label background
 
@@ -32,6 +34,11 @@ CROSSHAIR_SIZE = 20  # length of each arm from the center, in pixels
 CROSSHAIR_COLOR = (0, 0, 255)  # red, so it stands out from the green box
 CROSSHAIR_THICKNESS = 2  # line thickness in pixels
 CROSSHAIR_BOTTOM_MARGIN = 40  # distance from the bottom edge (keep > SIZE)
+
+# Target line from the crosshair to the bottle's center.
+LINE_COLOR = (0, 255, 255)  # yellow
+LINE_THICKNESS = 2  # line thickness in pixels
+TARGET_DOT_RADIUS = 4  # filled dot at the bottle's center, in pixels
 
 # Status text in the top-left corner.
 HUD_BG_COLOR = (0, 0, 0)  # black background
@@ -88,6 +95,23 @@ def compute_time_to_hit(distance_m, speed_mps):
     return t
 
 
+def compute_bearing(offset_px, focal_length_px):
+    """Return the bearing angle to the bottle along one axis, in degrees.
+
+    Used for both directions: the caller passes the horizontal offset for
+    the horizontal bearing and the vertical offset for the vertical one.
+
+    offset_px: signed offset of the bottle's center from the image center
+        along one axis, in pixels (right = positive horizontally,
+        up = positive vertically; the caller already handles the sign)
+    focal_length_px: the calibrated focal length, in pixels
+
+    Returns degrees with the same sign as offset_px (0 when centered).
+    """
+    theta_rad = math.atan(offset_px / focal_length_px)
+    return math.degrees(theta_rad)
+
+
 def touches_edge(y1, y2, frame_height):
     # A box touching the top or bottom edge is probably cut off, which makes
     # h too small (and the distance too large).
@@ -140,6 +164,55 @@ def measurement_texts(best, frame_height, focal_length, speed, smoothed_h):
     except NotImplementedError:
         return distance_text, "Time to hit: not implemented"
     return distance_text, f"Time to hit: {time_to_hit:.2f} s"
+
+
+def box_center(best):
+    # The middle of the box: halfway between the left and right edges, and
+    # halfway between the top and bottom edges.
+    x1, y1, x2, y2, conf = best
+    return ((x1 + x2) / 2, (y1 + y2) / 2)
+
+
+def bearing_texts(best, frame, focal_length):
+    # Work out the horizontal and vertical bearing lines for the HUD.
+    # Returns (horizontal_text, vertical_text).
+    if best is None:
+        return "Bearing H: --", "Bearing V: --"
+    if focal_length is None:
+        return "Bearing H: -- (not calibrated)", "Bearing V: --"
+
+    # The image center is where the camera points (its optical axis).
+    height, width = frame.shape[:2]
+    cx = width / 2
+    cy = height / 2
+
+    bx, by = box_center(best)
+
+    # Image x grows to the right, so right is already positive.
+    dx = bx - cx
+    # Image y grows DOWNWARD, so subtract the other way round to make up
+    # positive.
+    dy = cy - by
+
+    try:
+        bearing_h = compute_bearing(dx, focal_length)
+        bearing_v = compute_bearing(dy, focal_length)
+    except NotImplementedError:
+        return "Bearing H: not implemented", "Bearing V: not implemented"
+
+    # :+.1f always shows the sign (+ or -) and one decimal place. "deg"
+    # because OpenCV's fonts can't draw the degree symbol.
+    return f"Bearing H: {bearing_h:+.1f} deg", f"Bearing V: {bearing_v:+.1f} deg"
+
+
+def draw_target_line(frame, origin, best):
+    # Line from the crosshair to the bottle's center, plus a dot at the end.
+    # OpenCV needs whole-number pixel positions, so round the center.
+    bx, by = box_center(best)
+    center = (round(bx), round(by))
+    cv2.line(frame, origin, center, LINE_COLOR, LINE_THICKNESS)
+    # Thickness -1 means a filled circle.
+    cv2.circle(frame, center, TARGET_DOT_RADIUS, LINE_COLOR, -1)
 
 
 def load_calibration():
@@ -358,6 +431,10 @@ def main():
             distance_text, time_text = measurement_texts(
                 best, frame_height, focal_length, speed, smoothed_h)
 
+            # Bearing angles for the same bottle, from its raw box center.
+            bearing_h_text, bearing_v_text = bearing_texts(
+                best, frame, focal_length)
+
             # While calibrating, collect one h per frame, but only from frames
             # we can trust.
             if calibrating:
@@ -403,12 +480,19 @@ def main():
             draw_hud_text(frame, f"Speed: {speed:.1f} m/s (+/-)", 2)
             draw_hud_text(frame, distance_text, 3)
             draw_hud_text(frame, time_text, 4)
+            draw_hud_text(frame, bearing_h_text, 5)
+            draw_hud_text(frame, bearing_v_text, 6)
             if message:
-                draw_hud_text(frame, message, 5)
+                draw_hud_text(frame, message, 7)
+
+            origin = get_origin(frame)
+
+            # The target line only needs a bottle, not calibration.
+            if best is not None:
+                draw_target_line(frame, origin, best)
 
             # Draw the origin crosshair after detection (so YOLO only ever sees
-            # the clean frame) and last (so nothing else covers it).
-            origin = get_origin(frame)
+            # the clean frame) and last (so it sits on top of the line).
             draw_crosshair(frame, origin)
 
             # Hand the frame to the window. Nothing is drawn until waitKey runs.

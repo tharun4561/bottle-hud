@@ -126,13 +126,37 @@ It thinks that the clipped image of the object is just the object, but smaller. 
 
 \*\*How could you smooth it?\*\*
 
-Options: 
+Options:
 
 average last N values of h, 1 wrong value can make it inaccurate
 
 Exponential moving avg on h, lags
 
-median of last n values, less smooth 
+median of last n values, less smooth
+
+
+
+\## Milestone 6
+
+\*\*Why use atan instead of the raw pixel offset?\*\*
+
+The pixel offset is just an image, to turn it into an angle we need to know how far the object is from the lens
+
+
+
+\*\*What does the angle read with the bottle centered?\*\*
+
+The angle is 0 degrees horizontal and vertical 
+
+
+
+\*\*Why the line's slope isn't the bearing:\*\*
+
+the line starts from the crosshair while the bearing is measured from the middle of the camera's optical lens. 
+
+
+
+
 
 
 
