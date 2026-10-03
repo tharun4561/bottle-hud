@@ -178,3 +178,21 @@ decreasing the IMGSZ makes the screen smaller and less accurate, but makes the Y
 
 \- How it stays small and readable: Everything is in the top left.
 
+
+
+\## Milestone 8 (stretch)
+
+\*\*Why is aiming at the current position inefficient for a moving target?\*\*
+
+Following the object makes it need to follow its path, but if you predict it you can take a shorter path to intercept. 
+
+
+
+\*\*How is this like a real interceptor's guidance?\*\*
+
+It uses distance, time, angles, and prediction to guide the drone to the necessary location, all using a camera vision. 
+
+
+
+
+
