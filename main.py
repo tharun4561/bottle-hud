@@ -1,6 +1,6 @@
-"""Milestone 6: detect bottles with YOLO, mark a bottom-center origin,
-calibrate the camera's focal length, show live distance and time to hit,
-and draw a target line with horizontal and vertical bearing angles.
+"""Milestone 7: detect bottles with YOLO, mark a bottom-center origin,
+calibrate the camera's focal length, and show distance, time to hit, bearing
+angles, confidence, speed and FPS in a semi-transparent HUD panel.
 
 Press c to calibrate (press c again to cancel).
 Press + / - to change the interceptor speed.
@@ -10,6 +10,7 @@ Press q (or close the window) to quit.
 import json  # reading and writing calibration.json
 import math  # math functions for the bearing formula
 import sys  # used to exit the program with an error code
+import time  # high-precision clock for FPS
 from datetime import datetime  # timestamp saved with the calibration
 from pathlib import Path  # building file paths that work on any OS
 
@@ -21,7 +22,8 @@ WINDOW_NAME = "Bottle HUD"  # the title shown on the window
 
 MODEL_PATH = "yolo26n.pt"  # YOLO26 nano; downloaded automatically on first run
 TARGET_CLASS = "bottle"  # the only class we want to show
-CONF_THRESHOLD = 0.2  # hide detections the model is less sure about than this
+CONF_THRESHOLD = 0.1  # hide detections the model is less sure about than this
+IMGSZ = 640  # image size YOLO works at; smaller is faster but sees less detail
 BOX_COLOR = (0, 255, 0)  # green; OpenCV colors are (blue, green, red)
 TEXT_COLOR = (0, 0, 0)  # black text on the green label background
 
@@ -40,9 +42,20 @@ LINE_COLOR = (0, 255, 255)  # yellow
 LINE_THICKNESS = 2  # line thickness in pixels
 TARGET_DOT_RADIUS = 4  # filled dot at the bottle's center, in pixels
 
-# Status text in the top-left corner.
-HUD_BG_COLOR = (0, 0, 0)  # black background
-HUD_TEXT_COLOR = (255, 255, 255)  # white text
+# HUD panel.
+PANEL_X = 10  # left edge of the panel, in pixels
+PANEL_Y = 10  # top edge of the panel, in pixels
+PANEL_WIDTH = 260  # minimum width; grows only if a line needs more room
+PANEL_PADDING = 8  # space between the panel's edge and the text
+PANEL_VALUE_OFFSET = 70  # where the value column starts, from the text's left
+PANEL_ALPHA = 0.55  # background opacity: 0 = invisible, 1 = solid
+PANEL_BG_COLOR = (0, 0, 0)  # black background
+PANEL_LABEL_COLOR = (180, 180, 180)  # gray labels
+PANEL_TEXT_COLOR = (255, 255, 255)  # white values
+PANEL_STATUS_COLOR = (0, 255, 255)  # yellow status line
+PANEL_FONT_SCALE = 0.5
+PANEL_FONT_THICKNESS = 1
+STATUS_MESSAGE_SECONDS = 3.0  # how long "Saved"/"Cancelled" messages stay up
 
 # Calibration.
 BOTTLE_HEIGHT_M = 0.142  # real height of the bottle, in meters
@@ -58,9 +71,13 @@ CALIBRATION_PATH = Path(__file__).parent / CALIBRATION_FILE
 DEFAULT_SPEED_MPS = 5.0  # starting interceptor speed, in meters per second
 SPEED_STEP_MPS = 0.5  # how much each + or - press changes the speed
 
-# Smoothing of h (exponential moving average). Between 0 and 1: smaller is
+# Smoothing (exponential moving averages). Between 0 and 1: smaller is
 # steadier but slower to react, larger is quicker but jumpier.
-SMOOTHING_ALPHA = 0.3
+SMOOTHING_ALPHA = 0.3  # for the bottle's box height h
+FPS_SMOOTHING = 0.1  # for the frame time (FPS)
+# YOLO's first run is a slow warm-up (seconds, not milliseconds). Leave it out
+# of the FPS, or the smoothing would take a long time to forget it.
+WARMUP_FRAMES = 1
 
 
 def compute_focal_length(h_px, known_distance_m, bottle_height_m):
@@ -118,52 +135,54 @@ def touches_edge(y1, y2, frame_height):
     return y1 <= EDGE_MARGIN or y2 >= frame_height - EDGE_MARGIN
 
 
-def smooth_h(smoothed_h, new_h):
-    # Exponential moving average: mix a fraction (SMOOTHING_ALPHA) of the new
-    # value into the running value. One noisy frame can only move it a little.
+def ema(old, new, alpha):
+    # Exponential moving average: mix a fraction (alpha) of the new value
+    # into the running value, so one noisy value can only move it a little.
     # With no running value yet, start from the new value.
-    if smoothed_h is None:
-        return new_h
-    return SMOOTHING_ALPHA * new_h + (1 - SMOOTHING_ALPHA) * smoothed_h
+    if old is None:
+        return new
+    return alpha * new + (1 - alpha) * old
 
 
-def measurement_texts(best, frame_height, focal_length, speed, smoothed_h):
-    # Work out the distance and time-to-hit lines for the HUD. best is the
+def smooth_h(smoothed_h, new_h):
+    # Smooth the bottle's box height with SMOOTHING_ALPHA.
+    return ema(smoothed_h, new_h, SMOOTHING_ALPHA)
+
+
+def measurement_values(best, frame_height, focal_length, speed, smoothed_h):
+    # Work out the distance and time-to-hit values for the panel. best is the
     # most confident bottle as (x1, y1, x2, y2, conf), or None if there's no
     # bottle. smoothed_h is the smoothed box height, or None if there isn't
-    # one (then the raw h of best is used). Returns (distance_text, time_text).
-    if best is None:
-        return "Distance: --", "Time to hit: --"
+    # one (then the raw h of best is used).
+    # Returns (distance_text, time_text, reason). reason explains a "--"
+    # for the status line, or is None when there's nothing to explain.
     if focal_length is None:
-        return "Distance: -- (not calibrated)", "Time to hit: --"
+        return "--", "--", (f"Not calibrated: hold bottle at "
+                            f"{KNOWN_DISTANCE_M:.2f} m, press c")
+    if best is None:
+        return "--", "--", None
 
     x1, y1, x2, y2, conf = best
     if touches_edge(y1, y2, frame_height):
-        return "Distance: -- (bottle at edge)", "Time to hit: --"
+        return "--", "--", "Bottle at edge: distance unreliable"
 
     # Prefer the smoothed h; fall back to this frame's raw h.
     h = smoothed_h if smoothed_h is not None else y2 - y1
 
     # compute_distance divides by h, so a 0-pixel box would crash it.
     if h <= 0:
-        return "Distance: --", "Time to hit: --"
+        return "--", "--", None
 
-    try:
-        distance = compute_distance(h, focal_length, BOTTLE_HEIGHT_M)
-    except NotImplementedError:
-        return "Distance: not implemented", "Time to hit: --"
-    distance_text = f"Distance: {distance:.2f} m"
+    distance = compute_distance(h, focal_length, BOTTLE_HEIGHT_M)
+    distance_text = f"{distance:.2f} m"
 
     # Dividing by a speed of 0 would crash, and the interceptor would never
     # arrive anyway, so don't call compute_time_to_hit at all.
     if speed <= 0:
-        return distance_text, "Time to hit: -- (speed 0)"
+        return distance_text, "--", "Speed is 0: press + to speed up"
 
-    try:
-        time_to_hit = compute_time_to_hit(distance, speed)
-    except NotImplementedError:
-        return distance_text, "Time to hit: not implemented"
-    return distance_text, f"Time to hit: {time_to_hit:.2f} s"
+    time_to_hit = compute_time_to_hit(distance, speed)
+    return distance_text, f"{time_to_hit:.2f} s", None
 
 
 def box_center(best):
@@ -173,13 +192,12 @@ def box_center(best):
     return ((x1 + x2) / 2, (y1 + y2) / 2)
 
 
-def bearing_texts(best, frame, focal_length):
-    # Work out the horizontal and vertical bearing lines for the HUD.
-    # Returns (horizontal_text, vertical_text).
-    if best is None:
-        return "Bearing H: --", "Bearing V: --"
-    if focal_length is None:
-        return "Bearing H: -- (not calibrated)", "Bearing V: --"
+def bearing_values(best, frame, focal_length):
+    # Work out the horizontal and vertical bearing values for the panel.
+    # Returns (horizontal_text, vertical_text). The reason for a "--" (not
+    # calibrated) already comes from measurement_values.
+    if best is None or focal_length is None:
+        return "--", "--"
 
     # The image center is where the camera points (its optical axis).
     height, width = frame.shape[:2]
@@ -194,15 +212,12 @@ def bearing_texts(best, frame, focal_length):
     # positive.
     dy = cy - by
 
-    try:
-        bearing_h = compute_bearing(dx, focal_length)
-        bearing_v = compute_bearing(dy, focal_length)
-    except NotImplementedError:
-        return "Bearing H: not implemented", "Bearing V: not implemented"
+    bearing_h = compute_bearing(dx, focal_length)
+    bearing_v = compute_bearing(dy, focal_length)
 
     # :+.1f always shows the sign (+ or -) and one decimal place. "deg"
     # because OpenCV's fonts can't draw the degree symbol.
-    return f"Bearing H: {bearing_h:+.1f} deg", f"Bearing V: {bearing_v:+.1f} deg"
+    return f"{bearing_h:+.1f} deg", f"{bearing_v:+.1f} deg"
 
 
 def draw_target_line(frame, origin, best):
@@ -273,23 +288,63 @@ def draw_detection(frame, x1, y1, x2, y2, label):
                 FONT_SCALE, TEXT_COLOR, FONT_THICKNESS)
 
 
-def draw_hud_text(frame, text, line):
-    # Draw one line of status text in the top-left corner. line 0 is the top
-    # line, line 1 goes under it, and so on.
-    # Measure the line height from a fixed sample ("(" and "g" are the tallest
-    # and lowest characters), so every line is the same height no matter what
-    # text it holds, and the lines never overlap.
-    (_, text_h), baseline = cv2.getTextSize("(Ag)", FONT, FONT_SCALE,
-                                            FONT_THICKNESS)
-    (text_w, _), _ = cv2.getTextSize(text, FONT, FONT_SCALE, FONT_THICKNESS)
-    line_h = text_h + baseline + 8  # 8 px of padding
-    top = 10 + line * (line_h + 4)  # 10 px from the top, 4 px between lines
+def panel_text_width(text):
+    # Width of a piece of text in the panel's font, in pixels.
+    (text_w, _), _ = cv2.getTextSize(text, FONT, PANEL_FONT_SCALE,
+                                     PANEL_FONT_THICKNESS)
+    return text_w
 
-    # Filled background, then the text on top of it (same idea as the label).
-    cv2.rectangle(frame, (10, top), (10 + text_w + 8, top + line_h),
-                  HUD_BG_COLOR, -1)
-    cv2.putText(frame, text, (14, top + text_h + 4), FONT, FONT_SCALE,
-                HUD_TEXT_COLOR, FONT_THICKNESS)
+
+def draw_panel(frame, rows, status):
+    # Draw the HUD panel: a semi-transparent box with one (label, value) row
+    # per line, plus an optional status line at the bottom.
+
+    # Measure the line height from a fixed sample ("(" and "g" are the tallest
+    # and lowest characters), so every line is the same height.
+    (_, text_h), baseline = cv2.getTextSize("(Ag)", FONT, PANEL_FONT_SCALE,
+                                            PANEL_FONT_THICKNESS)
+    line_h = text_h + baseline + 6  # 6 px between lines
+
+    # Width: at least PANEL_WIDTH, wider only if a line needs it.
+    needed = max(PANEL_VALUE_OFFSET + panel_text_width(value)
+                 for label, value in rows)
+    if status:
+        needed = max(needed, panel_text_width(status))
+    width = max(PANEL_WIDTH, needed + 2 * PANEL_PADDING)
+
+    line_count = len(rows) + (1 if status else 0)
+    height = line_count * line_h + 2 * PANEL_PADDING
+
+    # Panel corners, kept inside the frame.
+    frame_h, frame_w = frame.shape[:2]
+    x1, y1 = PANEL_X, PANEL_Y
+    x2 = min(x1 + width, frame_w)
+    y2 = min(y1 + height, frame_h)
+
+    # Semi-transparent background, blended only inside the panel's area.
+    # frame[y1:y2, x1:x2] is that rectangle (rows first, then columns). It's
+    # a view into the frame, so writing into it changes the frame itself.
+    region = frame[y1:y2, x1:x2]
+    overlay = region.copy()
+    overlay[:] = PANEL_BG_COLOR  # fill the copy with the background color
+    # region = overlay * alpha + region * (1 - alpha)
+    cv2.addWeighted(overlay, PANEL_ALPHA, region, 1 - PANEL_ALPHA, 0,
+                    dst=region)
+
+    # Text, fully opaque on top of the background. putText's position is the
+    # bottom-left of the text, hence "+ text_h".
+    text_x = x1 + PANEL_PADDING
+    for i, (label, value) in enumerate(rows):
+        text_y = y1 + PANEL_PADDING + i * line_h + text_h
+        cv2.putText(frame, label, (text_x, text_y), FONT, PANEL_FONT_SCALE,
+                    PANEL_LABEL_COLOR, PANEL_FONT_THICKNESS)
+        cv2.putText(frame, value, (text_x + PANEL_VALUE_OFFSET, text_y), FONT,
+                    PANEL_FONT_SCALE, PANEL_TEXT_COLOR, PANEL_FONT_THICKNESS)
+
+    if status:
+        text_y = y1 + PANEL_PADDING + len(rows) * line_h + text_h
+        cv2.putText(frame, status, (text_x, text_y), FONT, PANEL_FONT_SCALE,
+                    PANEL_STATUS_COLOR, PANEL_FONT_THICKNESS)
 
 
 def get_origin(frame):
@@ -345,10 +400,16 @@ def main():
     # Calibration state.
     calibrating = False  # True while we're collecting samples
     samples = []  # box heights (h) collected so far
-    message = ""  # last calibration result or problem, shown on screen
+    message = ""  # last calibration result or progress, shown on the panel
+    message_time = 0.0  # when message was set (time.perf_counter() seconds)
 
     speed = DEFAULT_SPEED_MPS  # interceptor speed, changed with + and -
     smoothed_h = None  # running EMA of h; None until there's a bottle to track
+
+    # FPS state.
+    frame_time = None  # smoothed seconds per loop pass; None until measured
+    last_loop_start = None  # when the previous loop pass started
+    frame_count = 0  # loop passes so far
 
     # Connect to the webcam. This returns a "capture" object we read frames from.
     cap = cv2.VideoCapture(CAMERA_INDEX)
@@ -365,6 +426,17 @@ def main():
     # try/finally makes sure the cleanup below runs no matter how the loop ends.
     try:
         while True:
+            # perf_counter() is a high-precision clock in seconds. The time
+            # between the starts of two loop passes is one frame's time.
+            loop_start = time.perf_counter()
+            frame_count += 1
+            # The gap since the previous pass covers that pass, so skip it
+            # while the previous pass was a warm-up pass.
+            if frame_count > WARMUP_FRAMES + 1:
+                frame_time = ema(frame_time, loop_start - last_loop_start,
+                                 FPS_SMOOTHING)
+            last_loop_start = loop_start
+
             # Grab one frame (one still picture) from the camera.
             # ret is True if it worked; frame is the image itself.
             ret, frame = cap.read()
@@ -375,10 +447,12 @@ def main():
                 break
 
             # Run YOLO on this frame. conf= drops anything below our threshold
-            # (the model's own default is 0.25). verbose=False stops it
+            # (the model's own default is 0.25). imgsz= is the size YOLO
+            # shrinks the frame to before detecting. verbose=False stops it
             # printing a line for every frame. It returns one result per
             # image; we gave it one image, so take the first.
-            result = model(frame, conf=CONF_THRESHOLD, verbose=False)[0]
+            result = model(frame, conf=CONF_THRESHOLD, imgsz=IMGSZ,
+                           verbose=False)[0]
 
             # Every bottle found in this frame, as (x1, y1, x2, y2, conf).
             bottles = []
@@ -419,71 +493,58 @@ def main():
             else:
                 smoothed_h = None
 
-            # Show the raw h, plus the smoothed one when there is one.
-            if best is None:
-                h_text = "h: --"
-            elif smoothed_h is None:
-                h_text = f"h: {best[3] - best[1]} px"  # h = y2 - y1
-            else:
-                h_text = f"h: {best[3] - best[1]} px (smoothed {smoothed_h:.1f})"
-
             # Distance and time to hit for the same bottle.
-            distance_text, time_text = measurement_texts(
+            distance_text, time_text, reason = measurement_values(
                 best, frame_height, focal_length, speed, smoothed_h)
 
             # Bearing angles for the same bottle, from its raw box center.
-            bearing_h_text, bearing_v_text = bearing_texts(
+            bearing_h_text, bearing_v_text = bearing_values(
                 best, frame, focal_length)
 
             # While calibrating, collect one h per frame, but only from frames
             # we can trust.
             if calibrating:
                 if len(bottles) == 0:
-                    status = "no bottle, waiting"
+                    status = "no bottle"
                 elif len(bottles) > 1:
                     # Can't tell which box is the bottle at the known distance.
-                    status = f"{len(bottles)} bottles, waiting"
+                    status = f"{len(bottles)} bottles"
                 else:
                     x1, y1, x2, y2, conf = bottles[0]
                     if touches_edge(y1, y2, frame_height):
-                        status = "bottle at edge, waiting"
+                        status = "at edge"
                     else:
                         samples.append(y2 - y1)
-                        status = "collecting"
+                        status = f"h {y2 - y1}"
 
                 # Enough samples: average them and compute the focal length.
                 if len(samples) >= CALIBRATION_FRAMES:
                     calibrating = False
                     avg_h = sum(samples) / len(samples)
-                    try:
-                        focal_length = compute_focal_length(
-                            avg_h, KNOWN_DISTANCE_M, BOTTLE_HEIGHT_M)
-                        save_calibration(focal_length, avg_h)
-                        message = f"Saved: avg h {avg_h:.1f} px"
-                        print(f"Calibrated: avg h = {avg_h:.1f} px, "
-                              f"focal length = {focal_length:.1f} px")
-                    except NotImplementedError:
-                        message = "compute_focal_length not implemented yet"
-                        print(f"Calibration: avg h = {avg_h:.1f} px, but "
-                              "compute_focal_length is not implemented yet.")
+                    focal_length = compute_focal_length(
+                        avg_h, KNOWN_DISTANCE_M, BOTTLE_HEIGHT_M)
+                    save_calibration(focal_length, avg_h)
+                    message = f"Saved: f {focal_length:.1f} px"
+                    print(f"Calibrated: avg h = {avg_h:.1f} px, "
+                          f"focal length = {focal_length:.1f} px")
                 else:
-                    message = (f"Calibrating... {len(samples)}/"
-                               f"{CALIBRATION_FRAMES} ({status})")
+                    message = (f"Calibrating {len(samples)}/"
+                               f"{CALIBRATION_FRAMES}: {status}")
+                message_time = time.perf_counter()
 
-            # Status lines in the top-left corner.
-            draw_hud_text(frame, h_text, 0)
-            if focal_length is None:
-                draw_hud_text(frame, "Not calibrated: hold bottle at "
-                              f"{KNOWN_DISTANCE_M:.2f} m and press c", 1)
+            # The status line: a calibration message wins while calibrating
+            # or for a few seconds after it was set; otherwise the reason for
+            # any "--" values (or nothing).
+            message_is_fresh = (time.perf_counter() - message_time
+                                < STATUS_MESSAGE_SECONDS)
+            if message and (calibrating or message_is_fresh):
+                status_line = message
             else:
-                draw_hud_text(frame, f"Focal length: {focal_length:.1f} px", 1)
-            draw_hud_text(frame, f"Speed: {speed:.1f} m/s (+/-)", 2)
-            draw_hud_text(frame, distance_text, 3)
-            draw_hud_text(frame, time_text, 4)
-            draw_hud_text(frame, bearing_h_text, 5)
-            draw_hud_text(frame, bearing_v_text, 6)
-            if message:
-                draw_hud_text(frame, message, 7)
+                status_line = reason
+
+            # Panel values.
+            conf_text = f"{best[4]:.2f}" if best is not None else "--"
+            fps_text = f"{1 / frame_time:.0f}" if frame_time else "--"
 
             origin = get_origin(frame)
 
@@ -492,8 +553,19 @@ def main():
                 draw_target_line(frame, origin, best)
 
             # Draw the origin crosshair after detection (so YOLO only ever sees
-            # the clean frame) and last (so it sits on top of the line).
+            # the clean frame) and after the line (so it sits on top of it).
             draw_crosshair(frame, origin)
+
+            # The panel goes on last, on top of everything else.
+            draw_panel(frame, [
+                ("DIST", distance_text),
+                ("TIME", time_text),
+                ("BRG H", bearing_h_text),
+                ("BRG V", bearing_v_text),
+                ("CONF", conf_text),
+                ("SPEED", f"{speed:.1f} m/s  (+/-)"),
+                ("FPS", fps_text),
+            ], status_line)
 
             # Hand the frame to the window. Nothing is drawn until waitKey runs.
             cv2.imshow(WINDOW_NAME, frame)
@@ -515,7 +587,8 @@ def main():
                 else:
                     calibrating = True
                     samples = []
-                    message = f"Calibrating... 0/{CALIBRATION_FRAMES}"
+                    message = f"Calibrating 0/{CALIBRATION_FRAMES}"
+                message_time = time.perf_counter()
 
             # + (or =, the same key without Shift) speeds up; - slows down.
             # round() stops tiny decimal errors building up; max() keeps the

@@ -146,17 +146,35 @@ The pixel offset is just an image, to turn it into an angle we need to know how 
 
 \*\*What does the angle read with the bottle centered?\*\*
 
-The angle is 0 degrees horizontal and vertical 
+The angle is 0 degrees horizontal and vertical
 
 
 
 \*\*Why the line's slope isn't the bearing:\*\*
 
-the line starts from the crosshair while the bearing is measured from the middle of the camera's optical lens. 
+the line starts from the crosshair while the bearing is measured from the middle of the camera's optical lens.
 
 
 
 
 
+\## Milestone 7
 
+\*\*What's slowing the FPS down?\*\*
+
+More power on the laptop increased the fps, and using the GPU made it better. Also, making the IMGSZ = 480 helped
+
+
+
+\*\*What could speed it up?\*\*
+
+decreasing the IMGSZ makes the screen smaller and less accurate, but makes the YOLO run faster. I'm already at the fastest YOLO model (nano)
+
+
+
+
+
+\*\*HUD panel design:\*\*
+
+\- How it stays small and readable: Everything is in the top left.
 
