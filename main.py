@@ -1,7 +1,8 @@
-"""Milestone 8: track bottles with YOLO, mark a bottom-center origin,
-calibrate the camera's focal length, show distance, time to hit, bearing
-angles, velocity, confidence, speed and FPS in a HUD panel, and draw a lead
-line to where a moving bottle will be when the interceptor arrives.
+"""Deliverable 2, Milestone 1: track bottles with YOLO, mark a bottom-center
+origin, calibrate the camera's focal length, show distance, 3D position,
+time to hit, bearing angles, velocity, confidence, speed and FPS in a HUD
+panel, and draw a lead line to where a moving bottle will be when the
+interceptor arrives.
 
 Press c to calibrate (press c again to cancel).
 Press + / - to change the interceptor speed.
@@ -165,6 +166,29 @@ def predict_position(position_px, velocity_px_per_s, time_s):
     return predicted
 
 
+def compute_3d_position(offset_x_px, offset_y_px, distance_m, focal_length_px):
+    """Return the bottle's 3D position relative to the camera, in meters.
+
+    Coordinate system: the origin is at the camera lens. X is positive to
+    the right, Y is positive up, and Z is positive straight out of the
+    camera (the direction it's pointing).
+
+    offset_x_px: horizontal offset of the bottle's center from the image
+        center, in pixels (right = positive)
+    offset_y_px: vertical offset of the bottle's center from the image
+        center, in pixels (up = positive)
+    distance_m: the bottle's distance along the camera's view direction
+        (its depth), in meters
+    focal_length_px: the calibrated focal length, in pixels
+
+    Returns (X, Y, Z) in meters.
+    """
+    X = offset_x_px * distance_m / focal_length_px
+    Y = offset_y_px * distance_m / focal_length_px
+    Z = distance_m
+    return X, Y, Z
+
+
 def touches_edge(y1, y2, frame_height):
     # A box touching the top or bottom edge is probably cut off, which makes
     # h too small (and the distance too large).
@@ -221,25 +245,26 @@ def measurement_values(target, frame_height, focal_length, speed, smoothed_h):
     # the bottle as (x1, y1, x2, y2, conf, track_id), or None if there's no
     # bottle. smoothed_h is the smoothed box height, or None if there isn't
     # one (then the raw h of target is used).
-    # Returns (distance_text, time_text, time_to_hit, reason). time_to_hit
-    # is the number in seconds, or None. reason explains a "--" for the
-    # status line, or is None when there's nothing to explain.
+    # Returns (distance_text, time_text, distance, time_to_hit, reason).
+    # distance (meters) and time_to_hit (seconds) are the numbers, or None.
+    # reason explains a "--" for the status line, or is None when there's
+    # nothing to explain.
     if focal_length is None:
-        return "--", "--", None, (f"Not calibrated: hold bottle at "
-                                  f"{KNOWN_DISTANCE_M:.2f} m, press c")
+        return "--", "--", None, None, (f"Not calibrated: hold bottle at "
+                                        f"{KNOWN_DISTANCE_M:.2f} m, press c")
     if target is None:
-        return "--", "--", None, None
+        return "--", "--", None, None, None
 
     x1, y1, x2, y2 = target[:4]
     if touches_edge(y1, y2, frame_height):
-        return "--", "--", None, "Bottle at edge: distance unreliable"
+        return "--", "--", None, None, "Bottle at edge: distance unreliable"
 
     # Prefer the smoothed h; fall back to this frame's raw h.
     h = smoothed_h if smoothed_h is not None else y2 - y1
 
     # compute_distance divides by h, so a 0-pixel box would crash it.
     if h <= 0:
-        return "--", "--", None, None
+        return "--", "--", None, None, None
 
     distance = compute_distance(h, focal_length, BOTTLE_HEIGHT_M)
     distance_text = f"{distance:.2f} m"
@@ -247,10 +272,11 @@ def measurement_values(target, frame_height, focal_length, speed, smoothed_h):
     # Dividing by a speed of 0 would crash, and the interceptor would never
     # arrive anyway, so don't call compute_time_to_hit at all.
     if speed <= 0:
-        return distance_text, "--", None, "Speed is 0: press + to speed up"
+        return (distance_text, "--", distance, None,
+                "Speed is 0: press + to speed up")
 
     time_to_hit = compute_time_to_hit(distance, speed)
-    return distance_text, f"{time_to_hit:.2f} s", time_to_hit, None
+    return distance_text, f"{time_to_hit:.2f} s", distance, time_to_hit, None
 
 
 def box_center(target):
@@ -260,12 +286,10 @@ def box_center(target):
     return ((x1 + x2) / 2, (y1 + y2) / 2)
 
 
-def bearing_values(target, frame, focal_length):
-    # Work out the horizontal and vertical bearing values for the panel.
-    # Returns (horizontal_text, vertical_text). The reason for a "--" (not
-    # calibrated) already comes from measurement_values.
-    if target is None or focal_length is None:
-        return "--", "--"
+def center_offsets(target, frame):
+    # Offset of the bottle's (raw) box center from the image center, in
+    # pixels, as (dx, dy) with right = positive and up = positive. Shared by
+    # the bearings and the 3D position so they always agree.
 
     # The image center is where the camera points (its optical axis).
     height, width = frame.shape[:2]
@@ -279,6 +303,17 @@ def bearing_values(target, frame, focal_length):
     # Image y grows DOWNWARD, so subtract the other way round to make up
     # positive.
     dy = cy - by
+    return dx, dy
+
+
+def bearing_values(target, frame, focal_length):
+    # Work out the horizontal and vertical bearing values for the panel.
+    # Returns (horizontal_text, vertical_text). The reason for a "--" (not
+    # calibrated) already comes from measurement_values.
+    if target is None or focal_length is None:
+        return "--", "--"
+
+    dx, dy = center_offsets(target, frame)
 
     bearing_h = compute_bearing(dx, focal_length)
     bearing_v = compute_bearing(dy, focal_length)
@@ -286,6 +321,20 @@ def bearing_values(target, frame, focal_length):
     # :+.1f always shows the sign (+ or -) and one decimal place. "deg"
     # because OpenCV's fonts can't draw the degree symbol.
     return f"{bearing_h:+.1f} deg", f"{bearing_v:+.1f} deg"
+
+
+def position_values(target, frame, focal_length, distance):
+    # Work out the 3D position text for the panel, like "+0.10 / -0.03 /
+    # 1.02 m", from the raw box center and the (smoothed) distance. "--"
+    # when there's no distance (no bottle, not calibrated, or at the edge).
+    if target is None or focal_length is None or distance is None:
+        return "--"
+
+    dx, dy = center_offsets(target, frame)
+    X, Y, Z = compute_3d_position(dx, dy, distance, focal_length)
+
+    # :+.2f shows the sign for X and Y; Z is always positive.
+    return f"{X:+.2f} / {Y:+.2f} / {Z:.2f} m"
 
 
 def draw_target_line(frame, origin, target):
@@ -653,12 +702,17 @@ def main():
                      < STILL_SPEED_PX_S)
 
             # Distance and time to hit for the target.
-            distance_text, time_text, time_to_hit, reason = measurement_values(
-                target, frame_height, focal_length, speed, smoothed_h)
+            (distance_text, time_text, distance, time_to_hit,
+             reason) = measurement_values(target, frame_height, focal_length,
+                                          speed, smoothed_h)
 
             # Bearing angles for the target, from its raw box center.
             bearing_h_text, bearing_v_text = bearing_values(
                 target, frame, focal_length)
+
+            # 3D position: raw box center (like the bearings) and the
+            # smoothed distance (like DIST), so all three readouts agree.
+            pos_text = position_values(target, frame, focal_length, distance)
 
             # Predicted intercept point: where the target will be after the
             # time to hit. A still bottle uses velocity 0, so the point lands
@@ -749,6 +803,7 @@ def main():
             # The panel goes on last, on top of everything else.
             draw_panel(frame, [
                 ("DIST", distance_text),
+                ("POS", pos_text),
                 ("TIME", time_text),
                 ("BRG H", bearing_h_text),
                 ("BRG V", bearing_v_text),
@@ -781,12 +836,14 @@ def main():
                     message = f"Calibrating 0/{CALIBRATION_FRAMES}"
                 message_time = time.perf_counter()
 
-            # + (or =, the same key without Shift) speeds up; - slows down.
+            # + speeds up and - slows down. Each key counts with or without
+            # Shift: the +/= key gives "+" or "=", and the -/_ key gives "-"
+            # or "_" (Shift is easy to still be holding after typing "+").
             # round() stops tiny decimal errors building up; max() keeps the
             # speed from going below 0.
             if key in (ord("+"), ord("=")):
                 speed = round(speed + SPEED_STEP_MPS, 2)
-            if key == ord("-"):
+            if key in (ord("-"), ord("_")):
                 speed = max(0.0, round(speed - SPEED_STEP_MPS, 2))
 
             # Stop if the user closed the window with the X button.
