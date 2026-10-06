@@ -208,5 +208,15 @@ It uses distance, time, angles, and prediction to guide the drone to the necessa
 
 \*\*Why does f show up here?\*\*
 
-f converts the pixel offset into a direction in the x or y axis. 
+f converts the pixel offset into a direction in the x or y axis.
+
+
+
+\## Milestone 2: velocity fit
+
+\*\*Why is a fit better than first and last sample?\*\*
+
+The endpoint method only used two data points, and doesn't use the data points in between. This decreases accuracy, and can weigh outliers even more. 
+
+
 

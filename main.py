@@ -1,8 +1,8 @@
-"""Deliverable 2, Milestone 1: track bottles with YOLO, mark a bottom-center
+"""Deliverable 2, Milestone 2: track bottles with YOLO, mark a bottom-center
 origin, calibrate the camera's focal length, show distance, 3D position,
-time to hit, bearing angles, velocity, confidence, speed and FPS in a HUD
-panel, and draw a lead line to where a moving bottle will be when the
-interceptor arrives.
+time to hit, bearing angles, 3D velocity (least-squares fit), confidence,
+speed and FPS in a HUD panel, and draw a lead line to where a moving bottle
+will be when the interceptor arrives.
 
 Press c to calibrate (press c again to cancel).
 Press + / - to change the interceptor speed.
@@ -53,7 +53,10 @@ TARGET_DOT_RADIUS = 4  # filled dot at the bottle's center, in pixels
 LEAD_COLOR = (255, 0, 255)  # magenta
 LEAD_THICKNESS = 2  # line thickness in pixels
 
-# Velocity estimate for a moving bottle.
+# 3D velocity (m/s) from a least-squares fit over the last N positions.
+VELOCITY_WINDOW = 10  # samples per fit; more = steadier but slower to react
+
+# Pixel velocity for the lead line.
 HISTORY_SECONDS = 0.5  # how far back the position history reaches, in seconds
 MIN_HISTORY_SAMPLES = 3  # positions needed before the velocity is trusted
 VELOCITY_SMOOTHING = 0.3  # EMA weight for the velocity (0 to 1)
@@ -187,6 +190,41 @@ def compute_3d_position(offset_x_px, offset_y_px, distance_m, focal_length_px):
     Y = offset_y_px * distance_m / focal_length_px
     Z = distance_m
     return X, Y, Z
+
+
+def fit_velocity(times_s, positions_m):
+    """Return the velocity along one axis from a least-squares line fit.
+
+    Fits the straight line that comes closest to all the (time, position)
+    points at once, and returns its slope. Called once per axis (X, Y, Z).
+
+    times_s: sample times in seconds, already shifted so they're small
+        numbers (the caller subtracts the first timestamp)
+    positions_m: positions along one axis at those times, in meters (same
+        length as times_s)
+
+    Returns the slope in meters per second (0.0 if all the times are equal).
+    """
+    n = len(times_s)
+    t_mean = sum(times_s) / n
+    p_mean = sum(positions_m) / n
+
+    numerator = 0.0
+    denominator = 0.0
+    for t, p in zip(times_s, positions_m):
+        numerator += (t - t_mean) * (p - p_mean)
+        denominator += (t - t_mean) ** 2
+
+    if denominator == 0:
+        return 0.0
+    return numerator / denominator
+
+
+def signed(value, decimals):
+    # Format a number with a + or - sign, e.g. signed(0.1234, 2) = "+0.12".
+    # Rounding first and adding 0.0 turns a tiny negative like -0.001 into
+    # +0.00 instead of "-0.00" (Python keeps the minus sign on a rounded 0).
+    return f"{round(value, decimals) + 0.0:+.{decimals}f}"
 
 
 def touches_edge(y1, y2, frame_height):
@@ -333,8 +371,8 @@ def position_values(target, frame, focal_length, distance):
     dx, dy = center_offsets(target, frame)
     X, Y, Z = compute_3d_position(dx, dy, distance, focal_length)
 
-    # :+.2f shows the sign for X and Y; Z is always positive.
-    return f"{X:+.2f} / {Y:+.2f} / {Z:.2f} m"
+    # X and Y always show a sign; Z is always positive.
+    return f"{signed(X, 2)} / {signed(Y, 2)} / {Z:.2f} m"
 
 
 def draw_target_line(frame, origin, target):
@@ -551,6 +589,9 @@ def main():
     history_id = None  # the track ID the history belongs to
     last_seen = None  # when the target was last seen (perf_counter seconds)
     velocity = None  # smoothed (vx, vy) in px/s, image coordinates; or None
+    # (time, X, Y, Z) of the target in meters, raw (unsmoothed); maxlen drops
+    # the oldest sample automatically, so it always holds the last N.
+    history_3d = deque(maxlen=VELOCITY_WINDOW)
 
     # FPS state.
     frame_time = None  # smoothed seconds per loop pass; None until measured
@@ -656,14 +697,16 @@ def main():
             else:
                 smoothed_h = None
 
-            # Position history and velocity. Start over if the target is a
-            # different track, or if it was missing for too long. A short
-            # miss is fine: the timestamps just show a bigger gap.
+            # Position histories (pixel and 3D) and velocity. Start over if
+            # the target is a different track, or if it was missing for too
+            # long. A short miss is fine: the timestamps just show a bigger
+            # gap.
             missing_too_long = (last_seen is not None
                                 and frame_t - last_seen > LOST_TIMEOUT_S)
             if target is not None:
                 if target[5] != history_id or missing_too_long:
                     history.clear()
+                    history_3d.clear()
                     velocity = None
                     history_id = target[5]
                 last_seen = frame_t
@@ -677,6 +720,7 @@ def main():
                     history.append((frame_t, cx, cy))
             elif missing_too_long:
                 history.clear()
+                history_3d.clear()
                 velocity = None
 
             # Forget samples older than HISTORY_SECONDS.
@@ -713,6 +757,35 @@ def main():
             # 3D position: raw box center (like the bearings) and the
             # smoothed distance (like DIST), so all three readouts agree.
             pos_text = position_values(target, frame, focal_length, distance)
+
+            # 3D velocity sample: this frame's RAW position. The fit does the
+            # smoothing itself, so feeding it the smoothed distance would
+            # smooth twice and add lag. Only tracked bottles, and only frames
+            # with a distance (skips "--" frames, e.g. bottle at the edge,
+            # without resetting).
+            if distance is not None and target[5] is not None:
+                raw_h = target[3] - target[1]
+                if raw_h > 0:
+                    raw_distance = compute_distance(raw_h, focal_length,
+                                                    BOTTLE_HEIGHT_M)
+                    dx, dy = center_offsets(target, frame)
+                    X, Y, Z = compute_3d_position(dx, dy, raw_distance,
+                                                  focal_length)
+                    history_3d.append((frame_t, X, Y, Z))
+
+            # Fit once the window is full, so the noise level is always the
+            # same. Times are shifted to start at 0 to keep the numbers small
+            # (better floating-point precision).
+            velocity_3d = None  # (vx, vy, vz) in m/s, or None
+            if len(history_3d) == VELOCITY_WINDOW:
+                t_first = history_3d[0][0]
+                times = [s[0] - t_first for s in history_3d]
+                xs = [s[1] for s in history_3d]
+                ys = [s[2] for s in history_3d]
+                zs = [s[3] for s in history_3d]
+                velocity_3d = (fit_velocity(times, xs),
+                               fit_velocity(times, ys),
+                               fit_velocity(times, zs))
 
             # Predicted intercept point: where the target will be after the
             # time to hit. A still bottle uses velocity 0, so the point lands
@@ -789,16 +862,14 @@ def main():
             # Panel values.
             conf_text = f"{target[4]:.2f}" if target is not None else "--"
             fps_text = f"{1 / frame_time:.0f}" if frame_time else "--"
-            if velocity is None:
+            # 3D velocity: right, up, and away from the camera are positive
+            # (so a negative Z velocity means the bottle is approaching).
+            if velocity_3d is None:
                 vel_text = "--"
-            elif still:
-                vel_text = "still"
             else:
-                # Shown with up = positive, like the bearings, so flip y.
-                # round() first gives whole numbers, so a tiny negative like
-                # -0.3 shows as +0 instead of -0. :+d always shows the sign.
-                vel_text = (f"{round(velocity[0]):+d} / "
-                            f"{round(-velocity[1]):+d} px/s")
+                vx, vy, vz = velocity_3d
+                vel_text = (f"{signed(vx, 2)} / {signed(vy, 2)} / "
+                            f"{signed(vz, 2)} m/s")
 
             # The panel goes on last, on top of everything else.
             draw_panel(frame, [
