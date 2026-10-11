@@ -1,4 +1,4 @@
-ultralytics
-opencv-python
-numpy
-lap
+ultralytics==8.4.168
+opencv-python==5.0.0.93
+numpy==2.5.3
+lap==0.5.13
