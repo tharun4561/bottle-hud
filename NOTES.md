@@ -216,7 +216,39 @@ f converts the pixel offset into a direction in the x or y axis.
 
 \*\*Why is a fit better than first and last sample?\*\*
 
-The endpoint method only used two data points, and doesn't use the data points in between. This decreases accuracy, and can weigh outliers even more. 
+The endpoint method only used two data points, and doesn't use the data points in between. This decreases accuracy, and can weigh outliers even more.
+
+
+
+\## Milestone 3: intercept solve
+
+\*\*Derivation:\*\*
+
+|P + V·t| = s·t  →  (V·V − s²)t² + 2(P·V)t + P·P = 0
+
+Left side is where the bottle will be after t seconds. Right side is how far the interceptor has flown in t seconds. 
+
+
+
+\*\*What does no positive root mean physically?\*\*
+
+The interceptor can never reach the object, so basically it should have been launched sooner.
+
+
+
+\*\*Why is there exactly one positive root when the interceptor is faster?\*\*
+
+The gap always increases, and the root starts at negative, and crosses zero once to go to positive. 
+
+
+
+\## Milestone 4: projected lead line
+
+
+
+\*\*What happens when the bottle moves toward the camera?\*\*
+
+As the bottle approaches, Z shrinks, and since the projected offset is f·X/Z, any sideways offset gets magnified, so the lead line swings outward and gets jumpier
 
 
 

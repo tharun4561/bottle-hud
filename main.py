@@ -1,8 +1,8 @@
-"""Deliverable 2, Milestone 2: track bottles with YOLO, mark a bottom-center
+"""Deliverable 2, Milestone 4: track bottles with YOLO, mark a bottom-center
 origin, calibrate the camera's focal length, show distance, 3D position,
-time to hit, bearing angles, 3D velocity (least-squares fit), confidence,
-speed and FPS in a HUD panel, and draw a lead line to where a moving bottle
-will be when the interceptor arrives.
+intercept time and 3D aim point, bearing angles, 3D velocity (least-squares
+fit), confidence, speed and FPS in a HUD panel, and draw a lead line to the
+aim point projected back onto the screen.
 
 Press c to calibrate (press c again to cancel).
 Press + / - to change the interceptor speed.
@@ -49,18 +49,16 @@ LINE_COLOR = (0, 255, 255)  # yellow
 LINE_THICKNESS = 2  # line thickness in pixels
 TARGET_DOT_RADIUS = 4  # filled dot at the bottle's center, in pixels
 
-# Lead line from the crosshair to where the bottle will be at intercept.
+# Lead line from the crosshair to the 3D aim point, projected onto the screen.
 LEAD_COLOR = (255, 0, 255)  # magenta
 LEAD_THICKNESS = 2  # line thickness in pixels
+# Aim points closer than this (Z, in meters) aren't drawn. Projecting divides
+# by Z, so points at or behind the camera can't be drawn, and the whole
+# bottle only fits in the frame from about 0.18 m away anyway.
+MIN_AIM_Z_M = 0.20
 
 # 3D velocity (m/s) from a least-squares fit over the last N positions.
 VELOCITY_WINDOW = 10  # samples per fit; more = steadier but slower to react
-
-# Pixel velocity for the lead line.
-HISTORY_SECONDS = 0.5  # how far back the position history reaches, in seconds
-MIN_HISTORY_SAMPLES = 3  # positions needed before the velocity is trusted
-VELOCITY_SMOOTHING = 0.3  # EMA weight for the velocity (0 to 1)
-STILL_SPEED_PX_S = 20  # slower than this (px/s) counts as standing still
 LOST_TIMEOUT_S = 0.5  # missing longer than this (s) resets the history
 
 # HUD panel.
@@ -123,16 +121,6 @@ def compute_distance(h_px, focal_length_px, bottle_height_m):
     return d
 
 
-def compute_time_to_hit(distance_m, speed_mps):
-    """Return the time for the interceptor to reach the bottle, in seconds.
-
-    distance_m: distance to the bottle, in meters
-    speed_mps: interceptor speed, in meters per second (must be > 0)
-    """
-    t = distance_m / speed_mps
-    return t
-
-
 def compute_bearing(offset_px, focal_length_px):
     """Return the bearing angle to the bottle along one axis, in degrees.
 
@@ -148,25 +136,6 @@ def compute_bearing(offset_px, focal_length_px):
     """
     theta_rad = math.atan(offset_px / focal_length_px)
     return math.degrees(theta_rad)
-
-
-def predict_position(position_px, velocity_px_per_s, time_s):
-    """Return where the bottle will be after time_s seconds, along one axis.
-
-    Used for both directions: the caller passes x and the x velocity for the
-    horizontal position, and y and the y velocity for the vertical one.
-    Works in image coordinates (x grows to the right, y grows downward).
-    Assumes the bottle keeps moving at the same velocity.
-
-    position_px: the bottle's current position along one axis, in pixels
-    velocity_px_per_s: the bottle's velocity along that axis, in pixels per
-        second (signed: negative means moving toward smaller coordinates)
-    time_s: how far ahead to predict, in seconds (the time to hit)
-
-    Returns the predicted position along that axis, in pixels.
-    """
-    predicted = position_px + velocity_px_per_s * time_s
-    return predicted
 
 
 def compute_3d_position(offset_x_px, offset_y_px, distance_m, focal_length_px):
@@ -190,6 +159,29 @@ def compute_3d_position(offset_x_px, offset_y_px, distance_m, focal_length_px):
     Y = offset_y_px * distance_m / focal_length_px
     Z = distance_m
     return X, Y, Z
+
+
+def project_to_pixels(X, Y, Z, focal_length_px, center_x, center_y):
+    """Return where a 3D point appears on screen, in pixels.
+
+    The reverse of compute_3d_position: it takes a point in camera
+    coordinates and finds the pixel it lands on.
+
+    X, Y, Z: the point in meters, camera coordinates (X right, Y up, Z away
+        from the camera). The caller only calls this with Z above
+        MIN_AIM_Z_M, so Z is never 0 or negative.
+    focal_length_px: the calibrated focal length, in pixels
+    center_x, center_y: the image center, in pixels
+
+    Returns (pixel_x, pixel_y) as floats, in image coordinates: pixel x grows
+    to the right and pixel y grows DOWNWARD, so "up" (positive Y) has to be
+    flipped.
+    """
+    offset_x = focal_length_px * X / Z
+    offset_y = focal_length_px * Y / Z
+    pixel_x = center_x + offset_x
+    pixel_y = center_y - offset_y
+    return pixel_x, pixel_y
 
 
 def fit_velocity(times_s, positions_m):
@@ -218,6 +210,62 @@ def fit_velocity(times_s, positions_m):
     if denominator == 0:
         return 0.0
     return numerator / denominator
+
+
+def solve_intercept_time(P, V, speed_mps):
+    """Return the earliest time the interceptor can reach the moving bottle.
+
+    The interceptor starts at the camera (the origin) and flies in a straight
+    line at a constant speed. The bottle moves in a straight line at a
+    constant velocity. The intercept is when the interceptor's flight
+    distance (speed * t) equals the bottle's distance from the start point
+    at that time.
+
+    P: the bottle's position now, (x, y, z) in meters, measured from the
+        interceptor's start point (X right, Y up, Z away from the camera)
+    V: the bottle's velocity, (vx, vy, vz) in meters per second, same axes
+    speed_mps: interceptor speed in meters per second (the caller only
+        calls this with a speed above 0)
+
+    Note: when the interceptor speed equals the bottle's speed, the t^2
+    term of the equation vanishes, so it has to be solved as a straight
+    line instead (dividing by that term would crash).
+
+    Returns the smallest positive t in seconds, or None if there is no
+    valid intercept.
+    """
+    # Step 1: dot products
+    VV = V[0]*V[0] + V[1]*V[1] + V[2]*V[2]   # V·V, bottle speed squared
+    PV = P[0]*V[0] + P[1]*V[1] + P[2]*V[2]   # P·V
+    PP = P[0]*P[0] + P[1]*P[1] + P[2]*P[2]   # P·P, distance squared
+
+    # Step 2: quadratic coefficients for a*t^2 + b*t + c = 0
+    a = VV - speed_mps ** 2
+    b = 2 * PV
+    c = PP
+
+    # Step 3: if a is ~0, the t^2 term vanishes; solve b*t + c = 0
+    if abs(a) < 1e-9:
+        if b == 0:
+            return None
+        t = -c / b
+        return t if t > 0 else None
+
+    # Step 4: negative discriminant means no real roots, no intercept
+    disc = b * b - 4 * a * c
+    if disc < 0:
+        return None
+
+    # Step 5: both roots from the quadratic formula
+    root = math.sqrt(disc)
+    t1 = (-b - root) / (2 * a)
+    t2 = (-b + root) / (2 * a)
+
+    # Step 6: smallest positive root, or None
+    positive = [t for t in (t1, t2) if t > 0]
+    if not positive:
+        return None
+    return min(positive)
 
 
 def signed(value, decimals):
@@ -261,60 +309,41 @@ def choose_target(bottles, locked_id):
     return max(bottles, key=lambda b: b[4])  # index 4 is conf
 
 
-def estimate_velocity(history):
-    # Velocity in pixels per second from the position history, a list of
-    # (time, x, y). Uses the oldest and newest samples, so the change is
-    # measured over the whole window instead of between two frames, which
-    # would turn a pixel or two of box wobble into a big fake velocity.
-    # Returns (vx, vy) in image coordinates, or None if there isn't enough
-    # history yet.
-    if len(history) < MIN_HISTORY_SAMPLES:
-        return None
-    t0, x0, y0 = history[0]
-    t1, x1, y1 = history[-1]
-    dt = t1 - t0
-    if dt <= 0:
-        return None
-    return ((x1 - x0) / dt, (y1 - y0) / dt)
-
-
 def measurement_values(target, frame_height, focal_length, speed, smoothed_h):
-    # Work out the distance and time-to-hit values for the panel. target is
-    # the bottle as (x1, y1, x2, y2, conf, track_id), or None if there's no
-    # bottle. smoothed_h is the smoothed box height, or None if there isn't
-    # one (then the raw h of target is used).
-    # Returns (distance_text, time_text, distance, time_to_hit, reason).
-    # distance (meters) and time_to_hit (seconds) are the numbers, or None.
-    # reason explains a "--" for the status line, or is None when there's
+    # Work out the distance for the panel. target is the bottle as
+    # (x1, y1, x2, y2, conf, track_id), or None if there's no bottle.
+    # smoothed_h is the smoothed box height, or None if there isn't one (then
+    # the raw h of target is used).
+    # Returns (distance_text, distance, reason). distance is the number in
+    # meters, or None. reason explains a "--" for the status line (including
+    # a speed of 0, which blocks the intercept), or is None when there's
     # nothing to explain.
     if focal_length is None:
-        return "--", "--", None, None, (f"Not calibrated: hold bottle at "
-                                        f"{KNOWN_DISTANCE_M:.2f} m, press c")
+        return "--", None, (f"Not calibrated: hold bottle at "
+                            f"{KNOWN_DISTANCE_M:.2f} m, press c")
     if target is None:
-        return "--", "--", None, None, None
+        return "--", None, None
 
     x1, y1, x2, y2 = target[:4]
     if touches_edge(y1, y2, frame_height):
-        return "--", "--", None, None, "Bottle at edge: distance unreliable"
+        return "--", None, "Bottle at edge: distance unreliable"
 
     # Prefer the smoothed h; fall back to this frame's raw h.
     h = smoothed_h if smoothed_h is not None else y2 - y1
 
     # compute_distance divides by h, so a 0-pixel box would crash it.
     if h <= 0:
-        return "--", "--", None, None, None
+        return "--", None, None
 
     distance = compute_distance(h, focal_length, BOTTLE_HEIGHT_M)
     distance_text = f"{distance:.2f} m"
 
-    # Dividing by a speed of 0 would crash, and the interceptor would never
-    # arrive anyway, so don't call compute_time_to_hit at all.
+    # With a speed of 0 the interceptor never arrives, so there's no
+    # intercept; say why here.
     if speed <= 0:
-        return (distance_text, "--", distance, None,
-                "Speed is 0: press + to speed up")
+        return distance_text, distance, "Speed is 0: press + to speed up"
 
-    time_to_hit = compute_time_to_hit(distance, speed)
-    return distance_text, f"{time_to_hit:.2f} s", distance, time_to_hit, None
+    return distance_text, distance, None
 
 
 def box_center(target):
@@ -361,18 +390,47 @@ def bearing_values(target, frame, focal_length):
     return f"{bearing_h:+.1f} deg", f"{bearing_v:+.1f} deg"
 
 
+def format_xyz(point):
+    # Format a 3D point in meters for the panel, like "+0.10 / -0.03 / 1.02 m".
+    # X and Y always show a sign; Z only shows one if it's negative (behind
+    # the camera), since it's normally positive.
+    X, Y, Z = point
+    return f"{signed(X, 2)} / {signed(Y, 2)} / {Z:.2f} m"
+
+
 def position_values(target, frame, focal_length, distance):
-    # Work out the 3D position text for the panel, like "+0.10 / -0.03 /
-    # 1.02 m", from the raw box center and the (smoothed) distance. "--"
-    # when there's no distance (no bottle, not calibrated, or at the edge).
+    # Work out the 3D position from the raw box center and the (smoothed)
+    # distance. Returns (text, position): position is (X, Y, Z) in meters,
+    # or None, with text "--", when there's no distance (no bottle, not
+    # calibrated, or at the edge).
     if target is None or focal_length is None or distance is None:
-        return "--"
+        return "--", None
 
     dx, dy = center_offsets(target, frame)
-    X, Y, Z = compute_3d_position(dx, dy, distance, focal_length)
+    position = compute_3d_position(dx, dy, distance, focal_length)
+    return format_xyz(position), position
 
-    # X and Y always show a sign; Z is always positive.
-    return f"{signed(X, 2)} / {signed(Y, 2)} / {Z:.2f} m"
+
+def intercept_values(position, velocity_3d, speed):
+    # Work out the intercept time and 3D aim point for the panel.
+    # Returns (time_text, aim_text, t, aim, reason). t (seconds) and aim
+    # ((X, Y, Z) in meters) are None when there's no intercept. reason
+    # explains a "--" for the status line, or is None if there's nothing to
+    # add (no position or speed 0 is already explained by measurement_values).
+    if position is None or speed <= 0:
+        return "--", "--", None, None, None
+    if velocity_3d is None:
+        return "--", "--", None, None, "Measuring velocity..."
+
+    t = solve_intercept_time(position, velocity_3d, speed)
+    if t is None:
+        # With one positive root whenever the interceptor is faster, None
+        # only happens when the bottle is at least as fast as it.
+        return "--", "--", None, None, "No intercept: target too fast"
+
+    # Aim point: where the bottle will be after t seconds, P + V*t.
+    aim = tuple(p + v * t for p, v in zip(position, velocity_3d))
+    return f"{t:.2f} s", format_xyz(aim), t, aim, None
 
 
 def draw_target_line(frame, origin, target):
@@ -386,8 +444,9 @@ def draw_target_line(frame, origin, target):
 
 
 def draw_lead_line(frame, origin, lead):
-    # Line from the crosshair to the predicted intercept point. Returns True
-    # if the point is on screen, False if it's off screen.
+    # Line from the crosshair to the aim point on screen (lead is its
+    # (x, y) in pixels). Returns True if the point is on screen, False if
+    # it's off screen.
     height, width = frame.shape[:2]
     end = (round(lead[0]), round(lead[1]))
 
@@ -585,10 +644,8 @@ def main():
 
     # Tracking and velocity state.
     locked_id = None  # track ID of the bottle we're following
-    history = deque()  # (time, x, y) of that bottle's center, oldest first
     history_id = None  # the track ID the history belongs to
     last_seen = None  # when the target was last seen (perf_counter seconds)
-    velocity = None  # smoothed (vx, vy) in px/s, image coordinates; or None
     # (time, X, Y, Z) of the target in meters, raw (unsmoothed); maxlen drops
     # the oldest sample automatically, so it always holds the last N.
     history_3d = deque(maxlen=VELOCITY_WINDOW)
@@ -697,58 +754,22 @@ def main():
             else:
                 smoothed_h = None
 
-            # Position histories (pixel and 3D) and velocity. Start over if
-            # the target is a different track, or if it was missing for too
-            # long. A short miss is fine: the timestamps just show a bigger
-            # gap.
+            # 3D position history. Start over if the target is a different
+            # track, or if it was missing for too long. A short miss is fine:
+            # the timestamps just show a bigger gap.
             missing_too_long = (last_seen is not None
                                 and frame_t - last_seen > LOST_TIMEOUT_S)
             if target is not None:
                 if target[5] != history_id or missing_too_long:
-                    history.clear()
                     history_3d.clear()
-                    velocity = None
                     history_id = target[5]
                 last_seen = frame_t
-
-                # Only tracked bottles fully in view: a cut-off box's center
-                # creeps inward as the bottle leaves, which looks like motion.
-                if (target[5] is not None
-                        and not touches_edge(target[1], target[3],
-                                             frame_height)):
-                    cx, cy = box_center(target)
-                    history.append((frame_t, cx, cy))
             elif missing_too_long:
-                history.clear()
                 history_3d.clear()
-                velocity = None
 
-            # Forget samples older than HISTORY_SECONDS.
-            while history and frame_t - history[0][0] > HISTORY_SECONDS:
-                history.popleft()
-
-            # Velocity over the history window, then smoothed.
-            raw_velocity = estimate_velocity(history)
-            if raw_velocity is None:
-                velocity = None
-            elif velocity is None:
-                velocity = raw_velocity
-            else:
-                velocity = (ema(velocity[0], raw_velocity[0],
-                                VELOCITY_SMOOTHING),
-                            ema(velocity[1], raw_velocity[1],
-                                VELOCITY_SMOOTHING))
-
-            # Slower than STILL_SPEED_PX_S counts as standing still.
-            # math.hypot gives the overall speed from the x and y parts.
-            still = (velocity is not None
-                     and math.hypot(velocity[0], velocity[1])
-                     < STILL_SPEED_PX_S)
-
-            # Distance and time to hit for the target.
-            (distance_text, time_text, distance, time_to_hit,
-             reason) = measurement_values(target, frame_height, focal_length,
-                                          speed, smoothed_h)
+            # Distance for the target.
+            distance_text, distance, reason = measurement_values(
+                target, frame_height, focal_length, speed, smoothed_h)
 
             # Bearing angles for the target, from its raw box center.
             bearing_h_text, bearing_v_text = bearing_values(
@@ -756,7 +777,8 @@ def main():
 
             # 3D position: raw box center (like the bearings) and the
             # smoothed distance (like DIST), so all three readouts agree.
-            pos_text = position_values(target, frame, focal_length, distance)
+            pos_text, position = position_values(target, frame, focal_length,
+                                                 distance)
 
             # 3D velocity sample: this frame's RAW position. The fit does the
             # smoothing itself, so feeding it the smoothed distance would
@@ -787,16 +809,24 @@ def main():
                                fit_velocity(times, ys),
                                fit_velocity(times, zs))
 
-            # Predicted intercept point: where the target will be after the
-            # time to hit. A still bottle uses velocity 0, so the point lands
-            # on the bottle itself.
+            # True intercept time and 3D aim point, from the position shown
+            # in POS and the fitted velocity.
+            (time_text, aim_text, intercept_t, aim,
+             intercept_reason) = intercept_values(position, velocity_3d, speed)
+
+            # Lead point: the 3D aim point projected onto the screen. Points
+            # at or behind the camera (or too close to it) can't be drawn.
             lead = None
-            if (target is not None and velocity is not None
-                    and time_to_hit is not None):
-                vx, vy = (0.0, 0.0) if still else velocity
-                cx, cy = box_center(target)
-                lead = (predict_position(cx, vx, time_to_hit),
-                        predict_position(cy, vy, time_to_hit))
+            aim_reason = None
+            if aim is not None:
+                if aim[2] <= MIN_AIM_Z_M:
+                    aim_reason = "Aim point at/behind camera"
+                else:
+                    # The same image center the 3D position is measured from.
+                    frame_h, frame_w = frame.shape[:2]
+                    lead = project_to_pixels(aim[0], aim[1], aim[2],
+                                             focal_length,
+                                             frame_w / 2, frame_h / 2)
 
             # While calibrating, collect one h per frame, but only from frames
             # we can trust.
@@ -837,6 +867,7 @@ def main():
 
             # The lead line goes on top of the target line, so when the
             # bottle is still and they overlap, the lead line shows.
+            # Off-screen points keep the clipLine / hollow circle handling.
             lead_on_screen = True
             if lead is not None:
                 lead_on_screen = draw_lead_line(frame, origin, lead)
@@ -847,13 +878,19 @@ def main():
 
             # The status line: a calibration message wins while calibrating
             # or for a few seconds after it was set; then the reason for any
-            # "--" values; then an off-screen lead point (or nothing).
+            # "--" distance values; then the reason there's no intercept;
+            # then an aim point that can't be drawn; then an off-screen lead
+            # point (or nothing).
             message_is_fresh = (time.perf_counter() - message_time
                                 < STATUS_MESSAGE_SECONDS)
             if message and (calibrating or message_is_fresh):
                 status_line = message
             elif reason:
                 status_line = reason
+            elif intercept_reason:
+                status_line = intercept_reason
+            elif aim_reason:
+                status_line = aim_reason
             elif not lead_on_screen:
                 status_line = "Lead point off screen"
             else:
@@ -876,6 +913,7 @@ def main():
                 ("DIST", distance_text),
                 ("POS", pos_text),
                 ("TIME", time_text),
+                ("AIM", aim_text),
                 ("BRG H", bearing_h_text),
                 ("BRG V", bearing_v_text),
                 ("VEL", vel_text),
