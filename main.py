@@ -11,7 +11,10 @@ Usage:
 
 Press c to calibrate (press c again to cancel; webcam only).
 Press + / - to change the interceptor speed.
+Press d to show or hide the debug overlay, f to switch full screen.
 Press q (or close the window) to quit.
+
+The drawing is in hud.py; this file does the detection, tracking and math.
 """
 
 import argparse  # reading command-line options like --video
@@ -26,8 +29,11 @@ from pathlib import Path  # building file paths that work on any OS
 import cv2  # OpenCV: camera access, windows, and image drawing
 from ultralytics import YOLO  # Ultralytics: loads and runs YOLO models
 
+import hud  # all the HUD drawing
+
 CAMERA_INDEX = 0  # 0 = the first camera Windows finds (the built-in webcam)
-WINDOW_NAME = "Bottle HUD"  # the title shown on the window
+WINDOW_NAME = "Interceptor HUD"  # the title shown on the window
+WINDOW_SIZE = (1280, 720)  # starting window size; the HUD itself is bigger
 
 MODEL_PATH = "yolo26n.pt"  # YOLO26 nano; downloaded automatically on first run
 TARGET_CLASS = "bottle"  # the only class we want to show
@@ -37,27 +43,8 @@ IMGSZ = 640  # image size YOLO works at; smaller is faster but sees less detail
 # ByteTrack is lighter than the default BoT-SORT, which spends extra time
 # compensating for a moving camera (ours doesn't move).
 TRACKER_CONFIG = "bytetrack.yaml"
-BOX_COLOR = (0, 255, 0)  # green; OpenCV colors are (blue, green, red)
-TEXT_COLOR = (0, 0, 0)  # black text on the green label background
 
-FONT = cv2.FONT_HERSHEY_SIMPLEX
-LABEL_FONT_SCALE = 0.5  # box labels like "#7 0.85"
-LABEL_FONT_THICKNESS = 1
-
-# Crosshair that marks the origin point (bottom center of the frame).
-CROSSHAIR_SIZE = 20  # length of each arm from the center, in pixels
-CROSSHAIR_COLOR = (0, 0, 255)  # red, so it stands out from the green box
-CROSSHAIR_THICKNESS = 2  # line thickness in pixels
-CROSSHAIR_BOTTOM_MARGIN = 40  # distance from the bottom edge (keep > SIZE)
-
-# Target line from the crosshair to the bottle's center.
-LINE_COLOR = (0, 255, 255)  # yellow
-LINE_THICKNESS = 2  # line thickness in pixels
-TARGET_DOT_RADIUS = 4  # filled dot at the bottle's center, in pixels
-
-# Lead line from the crosshair to the 3D aim point, projected onto the screen.
-LEAD_COLOR = (255, 0, 255)  # magenta
-LEAD_THICKNESS = 2  # line thickness in pixels
+# Lead point: the 3D aim point projected onto the screen.
 # Aim points closer than this (Z, in meters) aren't drawn. Projecting divides
 # by Z, so points at or behind the camera can't be drawn, and the whole
 # bottle only fits in the frame from about 0.18 m away anyway.
@@ -67,19 +54,7 @@ MIN_AIM_Z_M = 0.20
 VELOCITY_WINDOW = 10  # samples per fit; more = steadier but slower to react
 LOST_TIMEOUT_S = 0.5  # missing longer than this (s) resets the history
 
-# HUD panel.
-PANEL_X = 10  # left edge of the panel, in pixels
-PANEL_Y = 10  # top edge of the panel, in pixels
-PANEL_WIDTH = 260  # minimum width; grows only if a line needs more room
-PANEL_PADDING = 8  # space between the panel's edge and the text
-PANEL_VALUE_OFFSET = 70  # where the value column starts, from the text's left
-PANEL_ALPHA = 0.55  # background opacity: 0 = invisible, 1 = solid
-PANEL_BG_COLOR = (0, 0, 0)  # black background
-PANEL_LABEL_COLOR = (180, 180, 180)  # gray labels
-PANEL_TEXT_COLOR = (255, 255, 255)  # white values
-PANEL_STATUS_COLOR = (0, 255, 255)  # yellow status line
-PANEL_FONT_SCALE = 0.5
-PANEL_FONT_THICKNESS = 1
+# Status line.
 STATUS_MESSAGE_SECONDS = 3.0  # how long "Saved"/"Cancelled" messages stay up
 
 # Calibration.
@@ -325,14 +300,15 @@ def measurement_values(target, frame_height, focal_length, speed, smoothed_h):
     # a speed of 0, which blocks the intercept), or is None when there's
     # nothing to explain.
     if focal_length is None:
-        return "--", None, (f"Not calibrated: hold bottle at "
+        return "--", None, (f"Not calibrated: hold {TARGET_CLASS} at "
                             f"{KNOWN_DISTANCE_M:.2f} m, press c")
     if target is None:
         return "--", None, None
 
     x1, y1, x2, y2 = target[:4]
     if touches_edge(y1, y2, frame_height):
-        return "--", None, "Bottle at edge: distance unreliable"
+        return "--", None, (f"{TARGET_CLASS.capitalize()} at edge: "
+                            "distance unreliable")
 
     # Prefer the smoothed h; fall back to this frame's raw h.
     h = smoothed_h if smoothed_h is not None else y2 - y1
@@ -380,20 +356,18 @@ def center_offsets(target, frame):
 
 
 def bearing_values(target, frame, focal_length):
-    # Work out the horizontal and vertical bearing values for the panel.
-    # Returns (horizontal_text, vertical_text). The reason for a "--" (not
-    # calibrated) already comes from measurement_values.
+    # Work out the horizontal and vertical bearing angles for the panel.
+    # Returns (bearing_h, bearing_v) in degrees (right and up positive), or
+    # None. The reason for a None (not calibrated) already comes from
+    # measurement_values.
     if target is None or focal_length is None:
-        return "--", "--"
+        return None
 
     dx, dy = center_offsets(target, frame)
 
     bearing_h = compute_bearing(dx, focal_length)
     bearing_v = compute_bearing(dy, focal_length)
-
-    # :+.1f always shows the sign (+ or -) and one decimal place. "deg"
-    # because OpenCV's fonts can't draw the degree symbol.
-    return f"{bearing_h:+.1f} deg", f"{bearing_v:+.1f} deg"
+    return bearing_h, bearing_v
 
 
 def format_xyz(point):
@@ -437,39 +411,6 @@ def intercept_values(position, velocity_3d, speed):
     # Aim point: where the bottle will be after t seconds, P + V*t.
     aim = tuple(p + v * t for p, v in zip(position, velocity_3d))
     return f"{t:.2f} s", format_xyz(aim), aim, None
-
-
-def draw_target_line(frame, origin, target):
-    # Line from the crosshair to the bottle's center, plus a dot at the end.
-    # OpenCV needs whole-number pixel positions, so round the center.
-    bx, by = box_center(target)
-    center = (round(bx), round(by))
-    cv2.line(frame, origin, center, LINE_COLOR, LINE_THICKNESS)
-    # Thickness -1 means a filled circle.
-    cv2.circle(frame, center, TARGET_DOT_RADIUS, LINE_COLOR, -1)
-
-
-def draw_lead_line(frame, origin, lead):
-    # Line from the crosshair to the aim point on screen (lead is its
-    # (x, y) in pixels). Returns True if the point is on screen, False if
-    # it's off screen.
-    height, width = frame.shape[:2]
-    end = (round(lead[0]), round(lead[1]))
-
-    if 0 <= end[0] < width and 0 <= end[1] < height:
-        cv2.line(frame, origin, end, LEAD_COLOR, LEAD_THICKNESS)
-        cv2.circle(frame, end, TARGET_DOT_RADIUS, LEAD_COLOR, -1)
-        return True
-
-    # Off screen: cut the line where it leaves the frame, keeping its
-    # direction. clipLine returns whether any part is inside the rectangle
-    # (x, y, width, height), and the two ends of the part that is.
-    inside, start, edge = cv2.clipLine((0, 0, width, height), origin, end)
-    if inside:
-        cv2.line(frame, start, edge, LEAD_COLOR, LEAD_THICKNESS)
-        # A hollow circle at the edge means "the point is beyond here".
-        cv2.circle(frame, edge, TARGET_DOT_RADIUS + 2, LEAD_COLOR, 2)
-    return False
 
 
 def load_calibration():
@@ -518,147 +459,6 @@ def save_calibration(focal_length, avg_h, frame_size):
     # indent=2 puts each field on its own line so it's easy to read.
     with open(CALIBRATION_PATH, "w") as f:
         json.dump(data, f, indent=2)
-
-
-def box_label(conf, track_id):
-    # Short label for a box, like "#7 0.85" (track ID and confidence), or
-    # just "0.85" for a box that isn't part of a track yet.
-    if track_id is None:
-        return f"{conf:.2f}"
-    return f"#{track_id} {conf:.2f}"
-
-
-def rects_overlap(a, b):
-    # True if two rectangles (x1, y1, x2, y2) overlap at all.
-    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
-
-
-def draw_label(frame, box, label, avoid):
-    # Draw a box's label on a green background. box is (x1, y1, x2, y2);
-    # avoid is a rectangle (x1, y1, x2, y2) the label must not cover (the
-    # HUD panel).
-
-    # Measure the text, so the background fits it. text_w/text_h are its
-    # width and height in pixels; baseline is the extra space below the line
-    # that letters like "g" hang into.
-    (text_w, text_h), baseline = cv2.getTextSize(label, FONT, LABEL_FONT_SCALE,
-                                                 LABEL_FONT_THICKNESS)
-    label_w = text_w + 8  # 4 px of padding on each side
-    label_h = text_h + baseline + 6
-
-    frame_h, frame_w = frame.shape[:2]
-    x1, y1, x2, y2 = box
-
-    # Line up with the box's left edge, but shift left if needed so the
-    # label never runs off the right edge of the frame.
-    left = max(0, min(x1, frame_w - label_w))
-
-    # Try above the box, then below it, then inside its top, then (for a box
-    # hidden behind the panel) just below the panel. Use the first spot that
-    # fits in the frame and doesn't cover the panel; if none does, fall back
-    # to inside the top of the box.
-    top = max(0, min(y1, frame_h - label_h))
-    for candidate in (y1 - label_h, y2, y1, avoid[3] + 2):
-        rect = (left, candidate, left + label_w, candidate + label_h)
-        if (candidate >= 0 and candidate + label_h <= frame_h
-                and not rects_overlap(rect, avoid)):
-            top = candidate
-            break
-
-    # Filled green rectangle (thickness -1), then the text on top of it.
-    # putText's position is the bottom-left of the text.
-    cv2.rectangle(frame, (left, top), (left + label_w, top + label_h),
-                  BOX_COLOR, -1)
-    cv2.putText(frame, label, (left + 4, top + text_h + 3), FONT,
-                LABEL_FONT_SCALE, TEXT_COLOR, LABEL_FONT_THICKNESS)
-
-
-def panel_text_width(text):
-    # Width of a piece of text in the panel's font, in pixels.
-    (text_w, _), _ = cv2.getTextSize(text, FONT, PANEL_FONT_SCALE,
-                                     PANEL_FONT_THICKNESS)
-    return text_w
-
-
-def draw_panel(frame, rows, status):
-    # Draw the HUD panel: a semi-transparent box with one (label, value) row
-    # per line, plus an optional status line at the bottom. Returns the
-    # panel's rectangle (x1, y1, x2, y2), so box labels can avoid it.
-
-    # Measure the line height from a fixed sample ("(" and "g" are the tallest
-    # and lowest characters), so every line is the same height.
-    (_, text_h), baseline = cv2.getTextSize("(Ag)", FONT, PANEL_FONT_SCALE,
-                                            PANEL_FONT_THICKNESS)
-    line_h = text_h + baseline + 6  # 6 px between lines
-
-    # Width: at least PANEL_WIDTH, wider only if a line needs it.
-    needed = max(PANEL_VALUE_OFFSET + panel_text_width(value)
-                 for label, value in rows)
-    if status:
-        needed = max(needed, panel_text_width(status))
-    width = max(PANEL_WIDTH, needed + 2 * PANEL_PADDING)
-
-    line_count = len(rows) + (1 if status else 0)
-    height = line_count * line_h + 2 * PANEL_PADDING
-
-    # Panel corners, kept inside the frame.
-    frame_h, frame_w = frame.shape[:2]
-    x1, y1 = PANEL_X, PANEL_Y
-    x2 = min(x1 + width, frame_w)
-    y2 = min(y1 + height, frame_h)
-
-    # Semi-transparent background, blended only inside the panel's area.
-    # frame[y1:y2, x1:x2] is that rectangle (rows first, then columns). It's
-    # a view into the frame, so writing into it changes the frame itself.
-    region = frame[y1:y2, x1:x2]
-    overlay = region.copy()
-    overlay[:] = PANEL_BG_COLOR  # fill the copy with the background color
-    # region = overlay * alpha + region * (1 - alpha)
-    cv2.addWeighted(overlay, PANEL_ALPHA, region, 1 - PANEL_ALPHA, 0,
-                    dst=region)
-
-    # Text, fully opaque on top of the background. putText's position is the
-    # bottom-left of the text, hence "+ text_h".
-    text_x = x1 + PANEL_PADDING
-    for i, (label, value) in enumerate(rows):
-        text_y = y1 + PANEL_PADDING + i * line_h + text_h
-        cv2.putText(frame, label, (text_x, text_y), FONT, PANEL_FONT_SCALE,
-                    PANEL_LABEL_COLOR, PANEL_FONT_THICKNESS)
-        cv2.putText(frame, value, (text_x + PANEL_VALUE_OFFSET, text_y), FONT,
-                    PANEL_FONT_SCALE, PANEL_TEXT_COLOR, PANEL_FONT_THICKNESS)
-
-    if status:
-        text_y = y1 + PANEL_PADDING + len(rows) * line_h + text_h
-        cv2.putText(frame, status, (text_x, text_y), FONT, PANEL_FONT_SCALE,
-                    PANEL_STATUS_COLOR, PANEL_FONT_THICKNESS)
-
-    return (x1, y1, x2, y2)
-
-
-def get_origin(frame):
-    # frame.shape is (height, width, colors): rows first, then columns.
-    height, width = frame.shape[:2]
-
-    # Horizontal center. // is whole-number division (pixels are whole numbers).
-    x = width // 2
-
-    # y = 0 is the TOP of the image and grows downward, so subtracting from
-    # the height moves the point up from the bottom edge.
-    y = height - CROSSHAIR_BOTTOM_MARGIN
-
-    return (x, y)
-
-
-def draw_crosshair(frame, origin):
-    x, y = origin
-
-    # Horizontal arm: from left of the center to right of it.
-    cv2.line(frame, (x - CROSSHAIR_SIZE, y), (x + CROSSHAIR_SIZE, y),
-             CROSSHAIR_COLOR, CROSSHAIR_THICKNESS)
-
-    # Vertical arm: from above the center to below it.
-    cv2.line(frame, (x, y - CROSSHAIR_SIZE), (x, y + CROSSHAIR_SIZE),
-             CROSSHAIR_COLOR, CROSSHAIR_THICKNESS)
 
 
 def parse_args(argv):
@@ -745,7 +545,7 @@ def main(argv=None):
     # frame size it was made with (None if the file doesn't say).
     focal_length, calibration_size = load_calibration()
     if focal_length is None:
-        print("Not calibrated yet. Hold the bottle at "
+        print(f"Not calibrated yet. Hold the {TARGET_CLASS} at "
               f"{KNOWN_DISTANCE_M:.2f} m and press c.")
     else:
         print(f"Loaded focal length: {focal_length:.1f} px")
@@ -758,6 +558,10 @@ def main(argv=None):
 
     speed = DEFAULT_SPEED_MPS  # interceptor speed, changed with + and -
     smoothed_h = None  # running EMA of h; None until there's a bottle to track
+
+    # The HUD, and the lock state it shows (SEARCHING / LOCKED / LOST).
+    display = hud.Hud(TARGET_CLASS)
+    lock = hud.LockIndicator()
 
     # Tracking and velocity state.
     locked_id = None  # track ID of the bottle we're following
@@ -798,10 +602,15 @@ def main(argv=None):
         sys.exit(1)  # exit code 1 means "something went wrong"
 
     if video_mode:
-        print(f"Playing {args.video}. Press +/- to change speed, q to quit.")
+        print(f"Playing {args.video}. Press +/- to change speed, d for debug, "
+              "f for full screen, q to quit.")
     else:
         print("Webcam opened. Press c to calibrate, +/- to change speed, "
-              "q to quit.")
+              "d for debug, f for full screen, q to quit.")
+
+    # A resizable window (needed for full screen), starting at WINDOW_SIZE.
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+    cv2.resizeWindow(WINDOW_NAME, *WINDOW_SIZE)
 
     # try/finally makes sure the cleanup below runs no matter how the loop ends.
     try:
@@ -841,6 +650,7 @@ def main(argv=None):
             else:
                 frame_t = time.perf_counter()
             stats["frames"] += 1
+            capture_done = time.perf_counter()  # for the debug stage timings
 
             # The focal length in pixels only fits the resolution it was
             # calibrated at, so warn once if this frame size is different.
@@ -895,10 +705,6 @@ def main(argv=None):
                 x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
                 bottles.append((x1, y1, x2, y2, conf, track_id))
 
-                # The box: top-left corner, bottom-right corner, color,
-                # line thickness.
-                cv2.rectangle(frame, (x1, y1), (x2, y2), BOX_COLOR, 2)
-
                 if track_id is not None:
                     stats["track_ids"].add(track_id)
 
@@ -940,8 +746,7 @@ def main(argv=None):
                 target, frame_height, focal_length, speed, smoothed_h)
 
             # Bearing angles for the target, from its raw box center.
-            bearing_h_text, bearing_v_text = bearing_values(
-                target, frame, focal_length)
+            bearing = bearing_values(target, frame, focal_length)
 
             # 3D position: raw box center (like the bearings) and the
             # smoothed distance (like DIST), so all three readouts agree.
@@ -995,15 +800,16 @@ def main(argv=None):
                     lead = project_to_pixels(aim[0], aim[1], aim[2],
                                              focal_length,
                                              frame_w / 2, frame_h / 2)
+            compute_done = time.perf_counter()  # for the debug stage timings
 
             # While calibrating, collect one h per frame, but only from frames
             # we can trust.
             if calibrating:
                 if len(bottles) == 0:
-                    status = "no bottle"
+                    status = f"no {TARGET_CLASS}"
                 elif len(bottles) > 1:
                     # Can't tell which box is the bottle at the known distance.
-                    status = f"{len(bottles)} bottles"
+                    status = f"{len(bottles)} {TARGET_CLASS}s"
                 else:
                     x1, y1, x2, y2 = bottles[0][:4]
                     if touches_edge(y1, y2, frame_height):
@@ -1028,22 +834,12 @@ def main(argv=None):
                                f"{CALIBRATION_FRAMES}: {status}")
                 message_time = time.perf_counter()
 
-            origin = get_origin(frame)
-
-            # The target line only needs a bottle, not calibration.
-            if target is not None:
-                draw_target_line(frame, origin, target)
-
-            # The lead line goes on top of the target line, so when the
-            # bottle is still and they overlap, the lead line shows.
-            # Off-screen points keep the clipLine / hollow circle handling.
-            lead_on_screen = True
-            if lead is not None:
-                lead_on_screen = draw_lead_line(frame, origin, lead)
-
-            # Draw the origin crosshair after detection (so YOLO only ever sees
-            # the clean frame) and after the lines (so it sits on top of them).
-            draw_crosshair(frame, origin)
+            # Whether the lead point lands inside the frame (the HUD cuts an
+            # off-screen lead line at the edge).
+            frame_h, frame_w = frame.shape[:2]
+            lead_on_screen = (lead is None
+                              or (0 <= round(lead[0]) < frame_w
+                                  and 0 <= round(lead[1]) < frame_h))
 
             # The status line: a calibration message wins while calibrating
             # or for a few seconds after it was set; then the reason for any
@@ -1065,9 +861,6 @@ def main(argv=None):
             else:
                 status_line = None
 
-            # Panel values.
-            conf_text = f"{target[4]:.2f}" if target is not None else "--"
-            fps_text = f"{1 / frame_time:.0f}" if frame_time else "--"
             # 3D velocity: right, up, and away from the camera are positive
             # (so a negative Z velocity means the bottle is approaching).
             if velocity_3d is None:
@@ -1077,28 +870,65 @@ def main(argv=None):
                 vel_text = (f"{signed(vx, 2)} / {signed(vy, 2)} / "
                             f"{signed(vz, 2)} m/s")
 
-            # The panel goes on top of everything except the box labels.
-            panel_rect = draw_panel(frame, [
-                ("DIST", distance_text),
+            # Debug overlay values (hidden unless d is pressed).
+            if bearing is None:
+                bearing_text = "--"
+            else:
+                bearing_text = (f"{signed(bearing[0], 1)} / "
+                                f"{signed(bearing[1], 1)} deg")
+            if focal_length is None:
+                f_text = "--"
+            elif calibration_size is None:
+                f_text = f"{focal_length:.1f} px"
+            else:
+                f_text = (f"{focal_length:.1f} px at {calibration_size[0]}x"
+                          f"{calibration_size[1]}")
+            debug_rows = [
+                ("h raw", f"{target[3] - target[1]} px"
+                          if target is not None else "--"),
+                ("h smooth", f"{smoothed_h:.1f} px"
+                             if smoothed_h is not None else "--"),
                 ("POS", pos_text),
-                ("TIME", time_text),
-                ("AIM", aim_text),
-                ("BRG H", bearing_h_text),
-                ("BRG V", bearing_v_text),
                 ("VEL", vel_text),
-                ("CONF", conf_text),
-                ("SPEED", f"{speed:.1f} m/s  (+/-)"),
-                ("FPS", fps_text),
-            ], status_line)
+                ("AIM", aim_text),
+                ("BRG", bearing_text),
+                ("SPEED", f"{speed:.1f} m/s"),
+                ("f", f_text),
+            ]
 
-            # Box labels last, placed so they don't cover the panel or run
-            # off the frame.
-            for bottle in bottles:
-                draw_label(frame, bottle[:4], box_label(bottle[4], bottle[5]),
-                           panel_rect)
+            if calibrating:
+                mode = f"CALIBRATING {len(samples)}/{CALIBRATION_FRAMES}"
+            else:
+                mode = "VIDEO" if video_mode else "LIVE"
 
-            # Hand the frame to the window. Nothing is drawn until waitKey runs.
-            cv2.imshow(WINDOW_NAME, frame)
+            # Lock state: the HUD only gets plain values, never the bottle
+            # tuples, so a different tracker only changes these calls.
+            if target is None:
+                state, lock_box, lock_id, lock_conf = lock.update(
+                    None, None, None, frame_t)
+            else:
+                state, lock_box, lock_id, lock_conf = lock.update(
+                    target[:4], target[5], target[4], frame_t)
+            others = [(b[:4], b[5], b[4]) for b in bottles if b is not target]
+
+            # The measurements belong to target. While the lock indicator
+            # holds on to a target that just disappeared, they'd describe a
+            # different box (or nothing), so leave them out of the HUD.
+            if target is None or target[5] != lock_id:
+                distance_text, bearing, time_text, lead = "--", None, "--", None
+
+            # Draw the HUD on a scaled-up copy; the frame itself stays clean.
+            image = display.render(
+                frame, state=state, box=lock_box, track_id=lock_id,
+                conf=lock_conf, others=others, lead=lead, distance_text=distance_text,
+                bearing=bearing, intercept_text=time_text,
+                fps=1 / frame_time if frame_time else None, mode=mode,
+                status=status_line, debug_rows=debug_rows,
+                timings=[("capture", capture_done - loop_start),
+                         ("detect + math", compute_done - capture_done)])
+
+            # Hand the image to the window. Nothing is drawn until waitKey runs.
+            cv2.imshow(WINDOW_NAME, image)
 
             # Let the window process its events (actually draw the frame) and
             # wait up to 1 ms for a key press. & 0xFF keeps only the lowest
@@ -1129,10 +959,29 @@ def main(argv=None):
             # or "_" (Shift is easy to still be holding after typing "+").
             # round() stops tiny decimal errors building up; max() keeps the
             # speed from going below 0.
+            # The speed isn't on the panel, so show it on the status line.
             if key in (ord("+"), ord("=")):
                 speed = round(speed + SPEED_STEP_MPS, 2)
+                message = f"Interceptor {speed:.1f} m/s"
+                message_time = time.perf_counter()
             if key in (ord("-"), ord("_")):
                 speed = max(0.0, round(speed - SPEED_STEP_MPS, 2))
+                message = f"Interceptor {speed:.1f} m/s"
+                message_time = time.perf_counter()
+
+            # d shows or hides the debug overlay.
+            if key == ord("d"):
+                display.toggle_debug()
+
+            # f switches between full screen and a normal window.
+            if key == ord("f"):
+                if cv2.getWindowProperty(WINDOW_NAME,
+                                         cv2.WND_PROP_FULLSCREEN) == 1:
+                    mode_flag = cv2.WINDOW_NORMAL
+                else:
+                    mode_flag = cv2.WINDOW_FULLSCREEN
+                cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN,
+                                      mode_flag)
 
             # Stop if the user closed the window with the X button.
             if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
