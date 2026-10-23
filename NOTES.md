@@ -172,5 +172,25 @@ As the bottle approaches, Z shrinks, and since the projected offset is f·X/Z, a
 
 &#x20;
 
-Milestone 5: cleaned up readme, and files. 
+Milestone 5: cleaned up readme, and files.
+
+
+
+# Deliverable 5
+
+
+
+## Milestone 1: Redesigned HUD
+
+What does someone watching for five seconds need to see?
+
+They need to see if the object is locked on, they need to see the confidence, the fps, the bearing, the interception time, and distance from object. 
+
+
+
+
+
+
+
+
 
