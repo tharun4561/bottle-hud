@@ -1,9 +1,10 @@
-"""Bottle tracker: detection, track ID lock, calibration, 3D position and velocity.
+"""Bottle tracker: detection, track ID lock, calibration, Kalman-filtered 3D
+position and velocity.
 
 Tracker.update() takes a camera frame and its timestamp and returns a Track:
 the detected bottles, the target bottle being followed, its distance, its 3D
-position and its 3D velocity. Nothing here draws on the frame, and nothing
-here needs to know about the interceptor.
+position and its 3D velocity (both from a Kalman filter). Nothing here draws
+on the frame, and nothing here needs to know about the interceptor.
 
 Positions use camera coordinates: the origin is the camera lens, X is
 positive to the right, Y positive up, and Z positive straight out of the
@@ -12,7 +13,6 @@ camera. Everything is in meters unless a name says px.
 
 import json  # reading and writing calibration.json
 import sys  # used to exit the program with an error code
-from collections import deque  # a list that's quick to trim from the front
 from datetime import datetime  # timestamp saved with the calibration
 from pathlib import Path  # building file paths that work on any OS
 from typing import NamedTuple, Optional
@@ -31,9 +31,18 @@ IMGSZ = 640  # image size YOLO works at; smaller is faster but sees less detail
 # new_track_thresh, so CONF_THRESHOLD alone can't make it show weaker ones.
 TRACKER_CONFIG = str(Path(__file__).parent / "bytetrack_low.yaml")
 
-# 3D velocity (m/s) from a least-squares fit over the last N positions.
-VELOCITY_WINDOW = 10  # samples per fit; more = steadier but slower to react
-LOST_TIMEOUT_S = 0.5  # missing longer than this (s) resets the history
+LOST_TIMEOUT_S = 0.5  # missing longer than this (s) resets the filter
+
+# Kalman filter for the target's 3D position and velocity. The bottle is
+# assumed to move at a roughly constant velocity; ACCEL_SIGMA_MPS2 is how much
+# that velocity may change per second (bigger = follows turns faster but is
+# noisier). The two pixel noise values say how much the box jitters: they set
+# how much each new measurement is trusted (bigger = smoother but slower).
+ACCEL_SIGMA_MPS2 = 1.0  # process noise: typical acceleration, in m/s^2
+CENTER_SIGMA_PX = 1.0  # noise in the box center position, in pixels
+HEIGHT_SIGMA_PX = 1.5  # noise in the box height h, in pixels
+INITIAL_VELOCITY_SIGMA_MPS = 3.0  # how unsure the first velocity guess (0) is
+WARMUP_UPDATES = 5  # measurements before the velocity is reported
 
 # Calibration.
 BOTTLE_HEIGHT_M = 0.142  # real height of the bottle, in meters
@@ -71,8 +80,11 @@ class Track(NamedTuple):
     reason: why distance is None (not calibrated, bottle at the edge), or None
     offsets: (dx, dy) of the target's raw box center from the image center,
         in pixels (right and up positive), or None when there is no target
-    position: the target's 3D (X, Y, Z) in meters, or None
-    velocity: the target's 3D (vx, vy, vz) in m/s, or None while measuring
+    position: the target's 3D (X, Y, Z) in meters, filtered by the Kalman
+        filter (the raw box position for a bottle that isn't tracked yet), or
+        None
+    velocity: the target's 3D (vx, vy, vz) in m/s from the Kalman filter, or
+        None while it's warming up
     message: calibration progress or result set during this frame, or None
     focal_length: the focal length (px) this frame was measured with, or
         None. A calibration that finishes on this frame only applies from
@@ -134,32 +146,117 @@ def compute_3d_position(offset_x_px, offset_y_px, distance_m, focal_length_px):
     return X, Y, Z
 
 
-def fit_velocity(times_s, positions_m):
-    """Return the velocity along one axis from a least-squares line fit.
+def measurement_sigmas(distance_m, focal_length_px):
+    """Return the expected noise of a raw 3D position, in meters.
 
-    Fits the straight line that comes closest to all the (time, position)
-    points at once, and returns its slope. Called once per axis (X, Y, Z).
+    A pixel of jitter is worth more meters the farther away the bottle is.
+    The sideways position X = dx * Z / f moves by Z / f meters per pixel.
+    The depth Z = f * H / h is worse: one pixel of h changes it by
+    Z^2 / (f * H), so its noise grows with the square of the distance.
 
-    times_s: sample times in seconds, already shifted so they're small
-        numbers (the caller subtracts the first timestamp)
-    positions_m: positions along one axis at those times, in meters (same
-        length as times_s)
-
-    Returns the slope in meters per second (0.0 if all the times are equal).
+    Returns (sigma_x, sigma_y, sigma_z).
     """
-    n = len(times_s)
-    t_mean = sum(times_s) / n
-    p_mean = sum(positions_m) / n
+    sideways = distance_m * CENTER_SIGMA_PX / focal_length_px
+    depth = (distance_m ** 2 * HEIGHT_SIGMA_PX
+             / (focal_length_px * BOTTLE_HEIGHT_M))
+    return sideways, sideways, depth
 
-    numerator = 0.0
-    denominator = 0.0
-    for t, p in zip(times_s, positions_m):
-        numerator += (t - t_mean) * (p - p_mean)
-        denominator += (t - t_mean) ** 2
 
-    if denominator == 0:
-        return 0.0
-    return numerator / denominator
+class AxisFilter:
+    """Kalman filter for one axis, with a constant-velocity model.
+
+    The state is the position p and velocity v. The covariance P is the 2x2
+    matrix [[pp, pv], [pv, vv]] (stored as three numbers because it's
+    symmetric): pp is how unsure the position is, vv how unsure the velocity
+    is, and pv how much their errors go together.
+    """
+
+    def __init__(self, position, position_var):
+        self.p = position
+        self.v = 0.0  # no idea yet; the large vv below says so
+        self.pp = position_var
+        self.pv = 0.0
+        self.vv = INITIAL_VELOCITY_SIGMA_MPS ** 2
+
+    def predict(self, dt):
+        """Move the state forward dt seconds (position += velocity * dt)."""
+        # P = F P F^T + Q with F = [[1, dt], [0, 1]]. Q is the noise from the
+        # velocity being allowed to change by ACCEL_SIGMA_MPS2 each second.
+        q = ACCEL_SIGMA_MPS2 ** 2
+        self.p += self.v * dt
+        self.pp += (2 * dt * self.pv + dt * dt * self.vv
+                    + q * dt ** 4 / 4)
+        self.pv += dt * self.vv + q * dt ** 3 / 2
+        self.vv += q * dt ** 2
+
+    def update(self, measured, measured_var):
+        """Blend in a position measurement with variance measured_var."""
+        # Gain: how much of the surprise (measured - predicted) to believe.
+        # Near 1 when the measurement is more certain than the prediction,
+        # near 0 when it's less. The velocity gets a share through pv.
+        gain_p = self.pp / (self.pp + measured_var)
+        gain_v = self.pv / (self.pp + measured_var)
+        surprise = measured - self.p
+        self.p += gain_p * surprise
+        self.v += gain_v * surprise
+        # P = (I - K H) P with H = [1, 0]: a measurement only ever shrinks
+        # the uncertainty.
+        self.vv -= gain_v * self.pv
+        self.pv *= 1 - gain_p
+        self.pp *= 1 - gain_p
+
+
+class BottleFilter:
+    """Kalman filter for the target's 3D position and velocity.
+
+    X, Y and Z are filtered separately: the model and the noise are the
+    same on each axis, so three small filters give the same answer as one
+    big one and are much easier to read.
+    """
+
+    def __init__(self):
+        self.axes = None  # three AxisFilters, or None until the first update
+        self.last_t = None  # time of the last measurement, in seconds
+        self.updates = 0  # measurements used so far
+
+    def reset(self):
+        """Forget everything (a different bottle, or a long gap)."""
+        self.axes = None
+        self.last_t = None
+        self.updates = 0
+
+    def update(self, t, position, sigmas):
+        """Use the raw position (X, Y, Z) measured at time t, in seconds.
+
+        sigmas: the expected noise of each coordinate, in meters (see
+        measurement_sigmas).
+        """
+        if self.axes is None:
+            self.axes = [AxisFilter(p, s ** 2)
+                         for p, s in zip(position, sigmas)]
+        else:
+            # The real time since the last measurement, so a slow frame or a
+            # missed detection just means a longer prediction step.
+            dt = max(t - self.last_t, 0.0)
+            for axis, p, s in zip(self.axes, position, sigmas):
+                axis.predict(dt)
+                axis.update(p, s ** 2)
+        self.last_t = t
+        self.updates += 1
+
+    @property
+    def position(self):
+        """Filtered (X, Y, Z) in meters, or None before the first update."""
+        if self.axes is None:
+            return None
+        return tuple(axis.p for axis in self.axes)
+
+    @property
+    def velocity(self):
+        """Filtered (vx, vy, vz) in m/s, or None while it's warming up."""
+        if self.axes is None or self.updates < WARMUP_UPDATES:
+            return None
+        return tuple(axis.v for axis in self.axes)
 
 
 def touches_edge(y1, y2, frame_height):
@@ -334,11 +431,10 @@ class Tracker:
         # Tracking and velocity state.
         self.smoothed_h = None  # running EMA of h; None until there's a bottle
         self.locked_id = None  # track ID of the bottle we're following
-        self.history_id = None  # the track ID the history belongs to
+        self.history_id = None  # the track ID the filter belongs to
         self.last_seen = None  # when the target was last seen (seconds)
-        # (time, X, Y, Z) of the target in meters, raw (unsmoothed); maxlen
-        # drops the oldest sample automatically, so it always holds the last N.
-        self.history_3d = deque(maxlen=VELOCITY_WINDOW)
+        # Filters the target's raw 3D positions into a position and velocity.
+        self.filter = BottleFilter()
 
     def toggle_calibration(self):
         """Start calibration, or cancel it if it's already running.
@@ -406,18 +502,18 @@ class Tracker:
         else:
             self.smoothed_h = None
 
-        # 3D position history. Start over if the target is a different
-        # track, or if it was missing for too long. A short miss is fine:
-        # the timestamps just show a bigger gap.
+        # Start the filter over if the target is a different track, or if it
+        # was missing for too long. A short miss is fine: the filter just
+        # predicts across the bigger time gap.
         missing_too_long = (self.last_seen is not None
                             and frame_t - self.last_seen > LOST_TIMEOUT_S)
         if target is not None:
             if target[5] != self.history_id or missing_too_long:
-                self.history_3d.clear()
+                self.filter.reset()
                 self.history_id = target[5]
             self.last_seen = frame_t
         elif missing_too_long:
-            self.history_3d.clear()
+            self.filter.reset()
 
         # Distance for the target.
         distance, reason = measure_distance(target, frame_height,
@@ -427,43 +523,39 @@ class Tracker:
         # and the 3D position both use it, so they always agree.
         offsets = center_offsets(target, frame) if target is not None else None
 
-        # 3D position: raw box center and the (smoothed) distance, so all
-        # the readouts agree. None when there's no distance (no bottle, not
-        # calibrated, or at the edge).
-        position = None
-        if target is not None and self.focal_length is not None \
-                and distance is not None:
-            position = compute_3d_position(offsets[0], offsets[1], distance,
-                                           self.focal_length)
-
-        # 3D velocity sample: this frame's RAW position. The fit does the
-        # smoothing itself, so feeding it the smoothed distance would
-        # smooth twice and add lag. Only tracked bottles, and only frames
-        # with a distance (skips "--" frames, e.g. bottle at the edge,
-        # without resetting).
+        # Feed the filter this frame's RAW position. The filter does the
+        # smoothing itself, so feeding it the smoothed distance would smooth
+        # twice and add lag. Only tracked bottles, and only frames with a
+        # distance (skips "--" frames, e.g. bottle at the edge, without
+        # resetting).
+        filtered = False  # whether the filter got a measurement this frame
         if distance is not None and target[5] is not None:
             raw_h = target[3] - target[1]
             if raw_h > 0:
                 raw_distance = compute_distance(raw_h, self.focal_length,
                                                 BOTTLE_HEIGHT_M)
                 dx, dy = offsets
-                X, Y, Z = compute_3d_position(dx, dy, raw_distance,
-                                              self.focal_length)
-                self.history_3d.append((frame_t, X, Y, Z))
+                raw_position = compute_3d_position(dx, dy, raw_distance,
+                                                   self.focal_length)
+                self.filter.update(frame_t, raw_position,
+                                   measurement_sigmas(raw_distance,
+                                                      self.focal_length))
+                filtered = True
 
-        # Fit once the window is full, so the noise level is always the
-        # same. Times are shifted to start at 0 to keep the numbers small
-        # (better floating-point precision).
-        velocity = None  # (vx, vy, vz) in m/s, or None
-        if len(self.history_3d) == VELOCITY_WINDOW:
-            t_first = self.history_3d[0][0]
-            times = [s[0] - t_first for s in self.history_3d]
-            xs = [s[1] for s in self.history_3d]
-            ys = [s[2] for s in self.history_3d]
-            zs = [s[3] for s in self.history_3d]
-            velocity = (fit_velocity(times, xs),
-                        fit_velocity(times, ys),
-                        fit_velocity(times, zs))
+        # 3D position: the filtered one when the filter was updated this
+        # frame. Otherwise (a bottle that isn't tracked yet) the raw box
+        # center with the smoothed distance. None when there's no distance
+        # (no bottle, not calibrated, or at the edge).
+        position = None
+        if filtered:
+            position = self.filter.position
+        elif target is not None and self.focal_length is not None \
+                and distance is not None:
+            position = compute_3d_position(offsets[0], offsets[1], distance,
+                                           self.focal_length)
+
+        # 3D velocity in m/s: None for the first few measurements.
+        velocity = self.filter.velocity if filtered else None
 
         # While calibrating, collect one h per frame, but only from frames
         # we can trust. This comes after the measurements above, so a frame
