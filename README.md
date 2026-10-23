@@ -54,6 +54,8 @@ Press `q` to stop. `record.py` records at the webcam's default resolution (the s
 | `c` | Start calibration; press again to cancel (webcam only) |
 | `+` or `=` | Increase the interceptor speed by 0.5 m/s |
 | `-` or `_` | Decrease the interceptor speed by 0.5 m/s (not below 0) |
+| `d` | Show or hide the debug overlay (hidden at start) |
+| `f` | Switch between full screen and a window |
 | `q` or the window's X button | Quit |
 
 ## Calibration
@@ -70,24 +72,50 @@ Recalibrate after changing the camera, the resolution or the YOLO model. If the 
 
 ## The HUD
 
-### Panel rows
+The HUD is drawn by `hud.py` for an audience. The camera frame is scaled up to 1920×1080 (`DISPLAY_SIZE`) before anything is drawn, so text stays sharp in full screen. A 4:3 webcam leaves a strip on the right, and the panel goes there instead of covering the video. Set `DISPLAY_SIZE` to the projector's native resolution.
 
-Positions use camera coordinates: the origin is the camera lens, **X** is positive to the right, **Y** positive up, and **Z** positive straight out of the camera.
+### Lock state
+
+The banner at the top shows the lock state, and the target gets corner brackets in the same color:
+
+| State | Meaning |
+| --- | --- |
+| `SEARCHING` (cyan) | No tracked target. An untracked detection gets thin cyan brackets |
+| `LOCKED BOTTLE #7` (green) | Following track 7. A miss shorter than 0.2 s (`LOST_GRACE_S`) keeps the lock, so one dropped detection doesn't flash the banner |
+| `LOST BOTTLE #7` (red, blinking) | The target disappeared; its last position blinks until 2 s (`LOST_HOLD_S`) after it was last seen |
+
+### Panel rows
 
 | Row | Meaning |
 | --- | --- |
-| `DIST` | Distance to the bottle along the camera's view direction (its depth Z), in meters, from the smoothed box height |
-| `POS` | The bottle's 3D position X / Y / Z, in meters |
-| `TIME` | Time for the interceptor to reach the bottle, in seconds, from the intercept solve |
-| `AIM` | The 3D aim point X / Y / Z, in meters: where the bottle will be when the interceptor arrives |
-| `BRG H` | Horizontal bearing: angle from the camera's view direction, in degrees (right is positive) |
-| `BRG V` | Vertical bearing, in degrees (up is positive) |
-| `VEL` | The bottle's 3D velocity X / Y / Z, in m/s (a negative Z velocity means it's approaching) |
-| `CONF` | YOLO's confidence for the target bottle, from 0 to 1 |
-| `SPEED` | Interceptor speed, in m/s (change it with `+` and `-`) |
+| `DISTANCE` | Distance to the target along the camera's view direction (its depth Z), in meters, from the smoothed box height |
+| `BEARING` | Angle from the camera's view direction, in whole degrees left/right and up/down |
+| `INTERCEPT IN` | Time for the interceptor to reach the target, in seconds, from the intercept solve |
+| `CONFIDENCE` | YOLO's confidence for the target |
 | `FPS` | Frames processed per second |
+| `MODE` | `LIVE` (webcam), `VIDEO` (`--video`) or `CALIBRATING 12/30` |
 
-A value shows `--` when it can't be computed, and the yellow status line under the panel explains why:
+### Debug overlay
+
+Press `d` for the engineering values. Positions use camera coordinates: the origin is the camera lens, **X** is positive to the right, **Y** positive up, and **Z** positive straight out of the camera.
+
+| Row | Meaning |
+| --- | --- |
+| `h raw` / `h smooth` | The target's box height this frame, and its smoothed value, in pixels |
+| `POS` | The target's 3D position X / Y / Z, in meters |
+| `VEL` | Its 3D velocity X / Y / Z, in m/s (a negative Z velocity means it's approaching) |
+| `AIM` | The 3D aim point X / Y / Z, in meters: where the target will be when the interceptor arrives |
+| `BRG` | Horizontal / vertical bearing, in degrees (right and up positive) |
+| `SPEED` | Interceptor speed, in m/s (change it with `+` and `-`; each change is also shown on the status line) |
+| `f` | Calibrated focal length, and the resolution it was made at |
+| `LEAD` | Whether the lead point is on screen |
+| `capture`, `detect + math`, `hud draw` | Smoothed time per stage, in milliseconds |
+
+Every detection also gets a `#7 0.85` label (track ID and confidence).
+
+### Status line
+
+A value shows `--` when it can't be computed, and the yellow status line under the banner explains why:
 
 | Status line | Meaning |
 | --- | --- |
@@ -102,17 +130,19 @@ A value shows `--` when it can't be computed, and the yellow status line under t
 | `Saved: f 615.3 px` / `Calibration cancelled` | Calibration finished or was cancelled (shown for 3 seconds) |
 | `Calibration only works with the webcam` | `c` was pressed in video mode |
 | `Warning: 320x240, calibrated at 640x480` | The frames don't match the calibration's resolution, so distances will be wrong |
+| `Interceptor 5.5 m/s` | The speed was changed with `+` or `-` (shown for 3 seconds) |
 
 ### On-screen graphics
 
 | Graphic | Meaning |
 | --- | --- |
-| Green box with a `#7 0.85` label | A detected bottle: track ID and confidence (just the confidence if it isn't tracked yet) |
+| Corner brackets with `BOTTLE #7` | The target, in the lock state's color |
+| Thin gray corner brackets | Other detections |
 | Red crosshair at the bottom center | Where both lines start: a screen convention for the launch point (the math puts the interceptor at the camera itself) |
-| Yellow line and dot | Target line to the bottle's current center |
-| Magenta line and dot | Lead line to the projected aim point; a hollow circle at the frame edge means the point is off screen |
+| Yellow line and dot | Target line to the target's current center |
+| Magenta line and reticle | Lead line to the projected aim point; a hollow circle at the frame edge means the point is off screen |
 
-The HUD follows one target bottle: it stays locked on the same track ID while it's visible, and otherwise picks the most confident bottle.
+The HUD follows one target: it stays locked on the same track ID while it's visible, and otherwise picks the most confident detection. The target class is `TARGET_CLASS` in `main.py`; changing it also changes every label and message. Switching to another object also needs its real height in `BOTTLE_HEIGHT_M` and a new calibration.
 
 ## How it works
 
@@ -175,6 +205,8 @@ The main settings are constants at the top of `main.py`:
 | `DEFAULT_SPEED_MPS` | 5.0 | Starting interceptor speed, in m/s |
 | `SPEED_STEP_MPS` | 0.5 | Change per `+` or `-` press, in m/s |
 
+The HUD's settings (display size, text sizes, colors, lock timing, `DEBUG_DEFAULT`) are constants at the top of `hud.py`.
+
 To compare settings fairly, record a few clips with `record.py` and run each setting on the same clips with `--video`; the summary at the end shows how often the bottle was tracked and how many track IDs it got.
 
 ## Known limitations
@@ -195,7 +227,8 @@ To compare settings fairly, record a few clips with `record.py` and run each set
 
 | File | Purpose |
 | --- | --- |
-| `main.py` | The HUD program |
+| `main.py` | The program: detection, tracking, measurements and the main loop |
+| `hud.py` | All HUD drawing |
 | `record.py` | Records test clips from the webcam |
 | `requirements.txt` | Python packages with tested versions |
 | `NOTES.md` | Development notes and answers for each milestone |
