@@ -184,13 +184,13 @@ Milestone 5: cleaned up readme, and files.
 
 What does someone watching for five seconds need to see?
 
-They need to see if the object is locked on, they need to see the confidence, the fps, the bearing, the interception time, and distance from object. 
+They need to see if the object is locked on, they need to see the confidence, the fps, the bearing, the interception time, and distance from object.
 
 
 
+## Milestone 2: Demo Mode:
 
+What can go wrong during a demo? 
 
-
-
-
+Camera can stop working, someone added something to the code, so it stops working, the environment isn't ideal for tracking. Using a pre-recorded video, we can use a scenario where the software works. 
 
