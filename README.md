@@ -196,6 +196,9 @@ To compare settings fairly, record a few clips with `record.py` and run each set
 | File | Purpose |
 | --- | --- |
 | `main.py` | The HUD program |
+| `tracker.py` | Detection, track ID lock, calibration, 3D position and velocity (not used by `main.py` yet) |
+| `intercept.py` | Intercept time, aim point and bearing angles; pure math (not used by `main.py` yet) |
+| `bytetrack_low.yaml` | ByteTrack settings with lowered confidence thresholds, used by `tracker.py` |
 | `record.py` | Records test clips from the webcam |
 | `requirements.txt` | Python packages with tested versions |
 | `NOTES.md` | Development notes and answers for each milestone |
