@@ -260,6 +260,10 @@ To compare settings fairly, record a few clips with `record.py` and run each set
 | `demo.bat` / `demo_backup.bat` | Demo launchers (live webcam / looping backup clip) |
 | `demo_clip.mp4` | The backup clip (record it with `record.py`; not in Git) |
 | `demo_error.log` | Crash details from demo mode, if any (not in Git) |
+| `main.py` | The HUD program |
+| `tracker.py` | Detection, track ID lock, calibration, 3D position and velocity (not used by `main.py` yet) |
+| `intercept.py` | Intercept time, aim point and bearing angles; pure math (not used by `main.py` yet) |
+| `bytetrack_low.yaml` | ByteTrack settings with lowered confidence thresholds, used by `tracker.py` |
 | `record.py` | Records test clips from the webcam |
 | `requirements.txt` | Python packages with tested versions |
 | `NOTES.md` | Development notes and answers for each milestone |
