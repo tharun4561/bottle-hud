@@ -1,8 +1,8 @@
-"""Bottle tracker: detection, track ID lock, calibration, Kalman-filtered 3D
+"""Target tracker: detection, track ID lock, calibration, Kalman-filtered 3D
 position and velocity.
 
 Tracker.update() takes a camera frame and its timestamp and returns a Track:
-the detected bottles, the target bottle being followed, its distance, its 3D
+the detected targets, the target being followed, its distance, its 3D
 position and its 3D velocity (both from a Kalman filter). Nothing here draws
 on the frame, and nothing here needs to know about the interceptor.
 
@@ -19,8 +19,9 @@ from typing import NamedTuple, Optional
 
 from ultralytics import YOLO  # Ultralytics: loads and runs YOLO models
 
-MODEL_PATH = "yolo26n.pt"  # YOLO26 nano; downloaded automatically on first run
-TARGET_CLASS = "bottle"  # the only class we want to track
+# YOLO nano trained on Roboflow to find the drone (starting from yolo26n.pt).
+MODEL_PATH = str(Path(__file__).parent / "PavoWeights.pt")
+TARGET_CLASS = "Drone-Interceptor"  # the model's only class
 CONF_THRESHOLD = 0.05  # hide detections the model is less sure about than this
 IMGSZ = 640  # image size YOLO works at; smaller is faster but sees less detail
 # Tracker that gives each bottle an ID that stays the same across frames.
@@ -40,13 +41,19 @@ LOST_TIMEOUT_S = 0.5  # missing longer than this (s) resets the filter
 # how much each new measurement is trusted (bigger = smoother but slower).
 ACCEL_SIGMA_MPS2 = 1.0  # process noise: typical acceleration, in m/s^2
 CENTER_SIGMA_PX = 1.0  # noise in the box center position, in pixels
-HEIGHT_SIGMA_PX = 1.5  # noise in the box height h, in pixels
+SIZE_SIGMA_PX = 1.5  # noise in the measured box side (see SIZE_AXIS), in pixels
 INITIAL_VELOCITY_SIGMA_MPS = 3.0  # how unsure the first velocity guess (0) is
 WARMUP_UPDATES = 5  # measurements before the velocity is reported
 
 # Calibration.
-BOTTLE_HEIGHT_M = 0.142  # real height of the bottle, in meters
-KNOWN_DISTANCE_M = 1.00  # distance from the webcam lens to the bottle, in meters
+# Distance comes from how big one side of the box looks: Z = f * size / pixels.
+# The drone is 97 x 97 mm and about 30 mm tall. Its width is the better ruler:
+# it's about 3x more pixels than the height, so a pixel of noise matters less.
+# A square body seen at an angle looks up to 1.4x wider, so keep it facing the
+# camera when calibrating. To use the height instead, set "height" and 0.030.
+SIZE_AXIS = "width"  # which side of the box to measure: "width" or "height"
+TARGET_SIZE_M = 0.097  # real size of the target along SIZE_AXIS, in meters
+KNOWN_DISTANCE_M = 1.00  # distance from the webcam lens to the target, in meters
 CALIBRATION_FRAMES = 30  # how many frames of h to average
 CALIBRATION_FILE = "calibration.json"
 EDGE_MARGIN = 5  # boxes this close (px) to the top/bottom edge may be cut off
@@ -54,7 +61,7 @@ EDGE_MARGIN = 5  # boxes this close (px) to the top/bottom edge may be cut off
 # Keep calibration.json next to this file, no matter which folder we run from.
 CALIBRATION_PATH = Path(__file__).parent / CALIBRATION_FILE
 
-# Smoothing (exponential moving average) for the bottle's box height h.
+# Smoothing (exponential moving average) for the measured box side.
 # Between 0 and 1: smaller is steadier but slower to react, larger is quicker
 # but jumpier.
 SMOOTHING_ALPHA = 0.3
@@ -101,25 +108,25 @@ class Track(NamedTuple):
     focal_length: Optional[float]
 
 
-def compute_focal_length(h_px, known_distance_m, bottle_height_m):
+def compute_focal_length(size_px, known_distance_m, target_size_m):
     """Return the camera's focal length in pixels.
 
-    h_px: the bottle's box height in the image, in pixels
-    known_distance_m: distance from the camera to the bottle, in meters
-    bottle_height_m: the bottle's real height, in meters
+    size_px: the target's box side (SIZE_AXIS) in the image, in pixels
+    known_distance_m: distance from the camera to the target, in meters
+    target_size_m: the target's real size along that side, in meters
     """
-    f = (h_px * known_distance_m) / bottle_height_m
+    f = (size_px * known_distance_m) / target_size_m
     return f
 
 
-def compute_distance(h_px, focal_length_px, bottle_height_m):
-    """Return the distance from the camera to the bottle, in meters.
+def compute_distance(size_px, focal_length_px, target_size_m):
+    """Return the distance from the camera to the target, in meters.
 
-    h_px: the bottle's box height in the image, in pixels
+    size_px: the target's box side (SIZE_AXIS) in the image, in pixels
     focal_length_px: the calibrated focal length, in pixels
-    bottle_height_m: the bottle's real height, in meters
+    target_size_m: the target's real size along that side, in meters
     """
-    d = (bottle_height_m * focal_length_px) / h_px
+    d = (target_size_m * focal_length_px) / size_px
     return d
 
 
@@ -151,14 +158,15 @@ def measurement_sigmas(distance_m, focal_length_px):
 
     A pixel of jitter is worth more meters the farther away the bottle is.
     The sideways position X = dx * Z / f moves by Z / f meters per pixel.
-    The depth Z = f * H / h is worse: one pixel of h changes it by
-    Z^2 / (f * H), so its noise grows with the square of the distance.
+    The depth Z = f * S / s (S the real size, s its pixels) is worse: one
+    pixel of s changes it by Z^2 / (f * S), so its noise grows with the
+    square of the distance.
 
     Returns (sigma_x, sigma_y, sigma_z).
     """
     sideways = distance_m * CENTER_SIGMA_PX / focal_length_px
-    depth = (distance_m ** 2 * HEIGHT_SIGMA_PX
-             / (focal_length_px * BOTTLE_HEIGHT_M))
+    depth = (distance_m ** 2 * SIZE_SIGMA_PX
+             / (focal_length_px * TARGET_SIZE_M))
     return sideways, sideways, depth
 
 
@@ -259,9 +267,19 @@ class BottleFilter:
         return tuple(axis.v for axis in self.axes)
 
 
-def touches_edge(y1, y2, frame_height):
-    # A box touching the top or bottom edge is probably cut off, which makes
-    # h too small (and the distance too large).
+def box_size(box):
+    # The pixel length of the box side we measure distance with.
+    x1, y1, x2, y2 = box[:4]
+    return x2 - x1 if SIZE_AXIS == "width" else y2 - y1
+
+
+def touches_edge(box, frame_width, frame_height):
+    # A box touching an edge that cuts across the measured side (left or right
+    # for the width, top or bottom for the height) is probably cut off, which
+    # makes the size too small (and the distance too large).
+    x1, y1, x2, y2 = box[:4]
+    if SIZE_AXIS == "width":
+        return x1 <= EDGE_MARGIN or x2 >= frame_width - EDGE_MARGIN
     return y1 <= EDGE_MARGIN or y2 >= frame_height - EDGE_MARGIN
 
 
@@ -274,9 +292,9 @@ def ema(old, new, alpha):
     return alpha * new + (1 - alpha) * old
 
 
-def smooth_h(smoothed_h, new_h):
-    # Smooth the bottle's box height with SMOOTHING_ALPHA.
-    return ema(smoothed_h, new_h, SMOOTHING_ALPHA)
+def smooth_size(smoothed, new_size):
+    # Smooth the measured box side with SMOOTHING_ALPHA.
+    return ema(smoothed, new_size, SMOOTHING_ALPHA)
 
 
 def choose_target(bottles, locked_id):
@@ -320,32 +338,32 @@ def center_offsets(target, frame):
     return dx, dy
 
 
-def measure_distance(target, frame_height, focal_length, smoothed_h):
-    # Work out the distance for the target. target is the bottle as
-    # (x1, y1, x2, y2, conf, track_id), or None if there's no bottle.
-    # smoothed_h is the smoothed box height, or None if there isn't one (then
-    # the raw h of target is used).
+def measure_distance(target, frame_width, frame_height, focal_length,
+                     smoothed_size):
+    # Work out the distance for the target. target is the box as
+    # (x1, y1, x2, y2, conf, track_id), or None if there's no target.
+    # smoothed_size is the smoothed box side, or None if there isn't one (then
+    # the raw size of target is used).
     # Returns (distance, reason). distance is in meters, or None. reason
     # explains a missing distance for the status line, or is None when
     # there's nothing to explain.
     if focal_length is None:
-        return None, (f"Not calibrated: hold bottle at "
+        return None, (f"Not calibrated: hold target at "
                       f"{KNOWN_DISTANCE_M:.2f} m, press c")
     if target is None:
         return None, None
 
-    x1, y1, x2, y2 = target[:4]
-    if touches_edge(y1, y2, frame_height):
-        return None, "Bottle at edge: distance unreliable"
+    if touches_edge(target, frame_width, frame_height):
+        return None, "Target at edge: distance unreliable"
 
-    # Prefer the smoothed h; fall back to this frame's raw h.
-    h = smoothed_h if smoothed_h is not None else y2 - y1
+    # Prefer the smoothed size; fall back to this frame's raw size.
+    size = smoothed_size if smoothed_size is not None else box_size(target)
 
-    # compute_distance divides by h, so a 0-pixel box would crash it.
-    if h <= 0:
+    # compute_distance divides by size, so a 0-pixel box would crash it.
+    if size <= 0:
         return None, None
 
-    return compute_distance(h, focal_length, BOTTLE_HEIGHT_M), None
+    return compute_distance(size, focal_length, TARGET_SIZE_M), None
 
 
 def load_calibration():
@@ -377,15 +395,16 @@ def load_calibration():
     return focal_length, frame_size
 
 
-def save_calibration(focal_length, avg_h, frame_size):
+def save_calibration(focal_length, avg_size, frame_size):
     # Save the result together with the values used to get it, so the file
     # explains itself later. frame_size is (width, height) in pixels: the
     # focal length in pixels is only valid at that resolution.
     data = {
         "focal_length_px": focal_length,
-        "avg_box_height_px": avg_h,
+        "avg_box_size_px": avg_size,
+        "size_axis": SIZE_AXIS,
         "known_distance_m": KNOWN_DISTANCE_M,
-        "bottle_height_m": BOTTLE_HEIGHT_M,
+        "target_size_m": TARGET_SIZE_M,
         "frames_averaged": CALIBRATION_FRAMES,
         "frame_width": frame_size[0],
         "frame_height": frame_size[1],
@@ -397,13 +416,13 @@ def save_calibration(focal_length, avg_h, frame_size):
 
 
 class Tracker:
-    """Detects and tracks bottles, and measures the target bottle in 3D."""
+    """Detects and tracks the target, and measures it in 3D."""
 
     def __init__(self):
         # Load the model once (loading is slow).
         self.model = YOLO(MODEL_PATH)
 
-        # model.names maps each class ID to its name, e.g. {39: 'bottle', ...}.
+        # model.names maps each class ID to its name, e.g. {0: 'Drone-Interceptor'}.
         # Look up the ID for our target class instead of hardcoding the number.
         self.bottle_id = None
         for class_id, name in self.model.names.items():
@@ -419,17 +438,17 @@ class Tracker:
         # the frame size it was made with (None if the file doesn't say).
         self.focal_length, self.calibration_size = load_calibration()
         if self.focal_length is None:
-            print("Not calibrated yet. Hold the bottle at "
+            print("Not calibrated yet. Hold the target at "
                   f"{KNOWN_DISTANCE_M:.2f} m and press c.")
         else:
             print(f"Loaded focal length: {self.focal_length:.1f} px")
 
         # Calibration state.
         self.calibrating = False  # True while we're collecting samples
-        self.samples = []  # box heights (h) collected so far
+        self.samples = []  # box sizes (px) collected so far
 
         # Tracking and velocity state.
-        self.smoothed_h = None  # running EMA of h; None until there's a bottle
+        self.smoothed_size = None  # running EMA of the size; None until a target
         self.locked_id = None  # track ID of the bottle we're following
         self.history_id = None  # the track ID the filter belongs to
         self.last_seen = None  # when the target was last seen (seconds)
@@ -489,18 +508,19 @@ class Tracker:
         if target is not None:
             self.locked_id = target[5]
 
-        # frame.shape[0] is the frame's height in pixels.
-        frame_height = frame.shape[0]
+        # frame.shape is (height, width, channels) in pixels.
+        frame_height, frame_width = frame.shape[:2]
 
-        # Smooth h only while there's exactly one bottle, fully in view.
-        # Otherwise start over: with two bottles the target can switch
-        # between them, and a cut-off box has a wrong h, so neither should
-        # be mixed into the running value.
-        if len(bottles) == 1 and not touches_edge(target[1], target[3],
+        # Smooth the size only while there's exactly one target, fully in
+        # view. Otherwise start over: with two targets the one we follow can
+        # switch between them, and a cut-off box has a wrong size, so neither
+        # should be mixed into the running value.
+        if len(bottles) == 1 and not touches_edge(target, frame_width,
                                                   frame_height):
-            self.smoothed_h = smooth_h(self.smoothed_h, target[3] - target[1])
+            self.smoothed_size = smooth_size(self.smoothed_size,
+                                             box_size(target))
         else:
-            self.smoothed_h = None
+            self.smoothed_size = None
 
         # Start the filter over if the target is a different track, or if it
         # was missing for too long. A short miss is fine: the filter just
@@ -516,8 +536,9 @@ class Tracker:
             self.filter.reset()
 
         # Distance for the target.
-        distance, reason = measure_distance(target, frame_height,
-                                            self.focal_length, self.smoothed_h)
+        distance, reason = measure_distance(target, frame_width, frame_height,
+                                            self.focal_length,
+                                            self.smoothed_size)
 
         # Offset of the raw box center from the image center. The bearings
         # and the 3D position both use it, so they always agree.
@@ -525,15 +546,15 @@ class Tracker:
 
         # Feed the filter this frame's RAW position. The filter does the
         # smoothing itself, so feeding it the smoothed distance would smooth
-        # twice and add lag. Only tracked bottles, and only frames with a
-        # distance (skips "--" frames, e.g. bottle at the edge, without
+        # twice and add lag. Only tracked targets, and only frames with a
+        # distance (skips "--" frames, e.g. target at the edge, without
         # resetting).
         filtered = False  # whether the filter got a measurement this frame
         if distance is not None and target[5] is not None:
-            raw_h = target[3] - target[1]
-            if raw_h > 0:
-                raw_distance = compute_distance(raw_h, self.focal_length,
-                                                BOTTLE_HEIGHT_M)
+            raw_size = box_size(target)
+            if raw_size > 0:
+                raw_distance = compute_distance(raw_size, self.focal_length,
+                                                TARGET_SIZE_M)
                 dx, dy = offsets
                 raw_position = compute_3d_position(dx, dy, raw_distance,
                                                    self.focal_length)
@@ -543,9 +564,9 @@ class Tracker:
                 filtered = True
 
         # 3D position: the filtered one when the filter was updated this
-        # frame. Otherwise (a bottle that isn't tracked yet) the raw box
+        # frame. Otherwise (a target that isn't tracked yet) the raw box
         # center with the smoothed distance. None when there's no distance
-        # (no bottle, not calibrated, or at the edge).
+        # (no target, not calibrated, or at the edge).
         position = None
         if filtered:
             position = self.filter.position
@@ -557,44 +578,46 @@ class Tracker:
         # 3D velocity in m/s: None for the first few measurements.
         velocity = self.filter.velocity if filtered else None
 
-        # While calibrating, collect one h per frame, but only from frames
+        # While calibrating, collect one size per frame, but only from frames
         # we can trust. This comes after the measurements above, so a frame
         # that finishes the calibration is still measured with the old
         # focal length, and the new one applies from the next frame.
         measured_with = self.focal_length
-        message = self._calibration_step(bottles, frame, frame_height)
+        message = self._calibration_step(bottles, frame)
 
         return Track(bottles, target, distance, reason, offsets, position,
                      velocity, message, measured_with)
 
-    def _calibration_step(self, bottles, frame, frame_height):
+    def _calibration_step(self, bottles, frame):
         # Returns the message to show for this frame, or None when not
         # calibrating.
         if not self.calibrating:
             return None
 
         if len(bottles) == 0:
-            status = "no bottle"
+            status = "no target"
         elif len(bottles) > 1:
-            # Can't tell which box is the bottle at the known distance.
-            status = f"{len(bottles)} bottles"
+            # Can't tell which box is the target at the known distance.
+            status = f"{len(bottles)} targets"
         else:
-            x1, y1, x2, y2 = bottles[0][:4]
-            if touches_edge(y1, y2, frame_height):
+            frame_height, frame_width = frame.shape[:2]
+            if touches_edge(bottles[0], frame_width, frame_height):
                 status = "at edge"
             else:
-                self.samples.append(y2 - y1)
-                status = f"h {y2 - y1}"
+                size = box_size(bottles[0])
+                self.samples.append(size)
+                status = f"size {size}"
 
         # Enough samples: average them and compute the focal length.
         if len(self.samples) >= CALIBRATION_FRAMES:
             self.calibrating = False
-            avg_h = sum(self.samples) / len(self.samples)
+            avg_size = sum(self.samples) / len(self.samples)
             self.focal_length = compute_focal_length(
-                avg_h, KNOWN_DISTANCE_M, BOTTLE_HEIGHT_M)
+                avg_size, KNOWN_DISTANCE_M, TARGET_SIZE_M)
             self.calibration_size = (frame.shape[1], frame.shape[0])
-            save_calibration(self.focal_length, avg_h, self.calibration_size)
-            print(f"Calibrated: avg h = {avg_h:.1f} px, "
+            save_calibration(self.focal_length, avg_size,
+                             self.calibration_size)
+            print(f"Calibrated: avg size = {avg_size:.1f} px, "
                   f"focal length = {self.focal_length:.1f} px")
             return f"Saved: f {self.focal_length:.1f} px"
         return f"Calibrating {len(self.samples)}/{CALIBRATION_FRAMES}: {status}"
