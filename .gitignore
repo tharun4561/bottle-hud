@@ -3,3 +3,4 @@ __pycache__/
 *.pt
 *.mp4
 calibration.json
+demo_error.log

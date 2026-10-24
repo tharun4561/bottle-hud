@@ -37,7 +37,28 @@ A recorded video file:
 .venv\Scripts\python.exe main.py --video clip.mp4
 ```
 
-In video mode, timestamps come from the file itself, so velocities are correct even though processing is slower than real time. The program exits by itself at the end of the file and prints a summary (frames processed, frames with a tracked bottle, distinct track IDs, processing speed and the current settings).
+In video mode, timestamps come from the file itself, so velocities are correct even though processing is slower than real time. The program exits by itself at the end of the file and prints a summary (frames processed, frames with a tracked bottle, distinct track IDs, processing speed and the current settings). Add `--loop` to start the video again at the end instead.
+
+Other options: `--model PATH` uses a different YOLO model file (relative paths are taken from the project folder), and `--screen N` puts the window on monitor N (`--screen` alone lists the monitors). Run with `--help` for the full list.
+
+### Demo mode
+
+Double-click **`demo.bat`** (or run it from any terminal; nothing needs activating). It runs `main.py --demo` with the project's own Python. If the webcam fails, double-click **`demo_backup.bat`**: it replays `demo_clip.mp4` from the project folder in a loop (`--demo --video demo_clip.mp4 --loop`). Extra options are passed on, e.g. `demo.bat --screen 2`.
+
+Demo mode:
+
+- Runs pre-flight checks before the window opens, printing one line per problem: `FAIL` (model file missing, webcam or video won't open, no frames) stops the program; `WARN` (not calibrated, resolution doesn't match the calibration) doesn't.
+- Never downloads anything: the model file must already be in the project folder, and the launchers set `YOLO_OFFLINE=1` so Ultralytics skips its internet check.
+- Warms up the model before the window opens and prints the startup time, e.g. `Ready in 10.5 s (Python + imports 4.5 s, checks + camera 1.4 s, model 0.1 s, warm-up 4.2 s, window 0.3 s)`. The first launch after a reboot is slower.
+- Starts full screen with the debug overlay off and the key legend showing for 8 seconds.
+- Needs `q` pressed twice (within 3 seconds) to quit, so one stray key press can't end it.
+- Keeps the laptop from sleeping or turning the screen off.
+- Keeps the window up if the webcam disconnects, showing "Camera lost: reconnecting..." and trying again every second.
+- Saves the details of any crash to `demo_error.log` and prints one line instead of a traceback.
+
+**On the projector:** the simplest setup is Windows' **Duplicate** mode (Win+P), which shows the same picture on the laptop and the projector. With **Extend**, use `demo.bat --screen 2` (check the number with `--screen` first), or drag the window onto the projector and press `f`. Full screen always fills the monitor the window is on, at that monitor's own resolution. Keys only work while the HUD window has focus; click it if they seem dead.
+
+**Before the demo:** plug in the charger and set the power mode to Best performance; turn on Do not disturb; close Zoom, Teams and any browser tab that might use the camera; turn off Windows Studio Effects; bring the bottle and a tape measure (to recalibrate at 1.00 m if needed); copy `demo_clip.mp4` into the project folder; and do one full launch at the venue before going on.
 
 ### Recording test clips
 
@@ -54,9 +75,11 @@ Press `q` to stop. `record.py` records at the webcam's default resolution (the s
 | `c` | Start calibration; press again to cancel (webcam only) |
 | `+` or `=` | Increase the interceptor speed by 0.5 m/s |
 | `-` or `_` | Decrease the interceptor speed by 0.5 m/s (not below 0) |
+| `r` | Reset the lock, so the most confident target is picked again |
 | `d` | Show or hide the debug overlay (hidden at start) |
+| `h` | Show or hide the key legend (shown for the first 8 seconds) |
 | `f` | Switch between full screen and a window |
-| `q` or the window's X button | Quit |
+| `q` or the window's X button | Quit (in demo mode, press `q` twice) |
 
 ## Calibration
 
@@ -72,7 +95,7 @@ Recalibrate after changing the camera, the resolution or the YOLO model. If the 
 
 ## The HUD
 
-The HUD is drawn by `hud.py` for an audience. The camera frame is scaled up to 1920×1080 (`DISPLAY_SIZE`) before anything is drawn, so text stays sharp in full screen. A 4:3 webcam leaves a strip on the right, and the panel goes there instead of covering the video. Set `DISPLAY_SIZE` to the projector's native resolution.
+The HUD is drawn by `hud.py` for an audience. The camera frame is scaled up before anything is drawn, so text stays sharp: in full screen to the screen's own resolution, otherwise to 1920×1080 (`DISPLAY_SIZE`). The panel goes in a strip on the right instead of covering the video (a 4:3 webcam leaves one on a 16:9 screen; on 16:10 the video shrinks slightly to make room).
 
 ### Lock state
 
@@ -131,6 +154,9 @@ A value shows `--` when it can't be computed, and the yellow status line under t
 | `Calibration only works with the webcam` | `c` was pressed in video mode |
 | `Warning: 320x240, calibrated at 640x480` | The frames don't match the calibration's resolution, so distances will be wrong |
 | `Interceptor 5.5 m/s` | The speed was changed with `+` or `-` (shown for 3 seconds) |
+| `Lock reset: reacquiring` | `r` was pressed |
+| `Press q again to quit` | `q` was pressed once in demo mode |
+| `Camera lost: reconnecting...` | The webcam stopped sending frames; the last frame stays up until it's back |
 
 ### On-screen graphics
 
@@ -222,6 +248,7 @@ To compare settings fairly, record a few clips with `record.py` and run each set
 - **Tracking:** IDs can switch when bottles cross; a bottle needs one detection at 0.25 confidence or above before it's tracked; calibration needs exactly one bottle in view.
 - **Performance:** CPU only, about 11 to 19 FPS on the development laptop. GPU acceleration through PyTorch (CUDA) needs an NVIDIA card.
 - **Video mode:** footage must come from the same camera at the same resolution as the calibration.
+- **Demo mode:** `r` and each `--loop` restart only reset this program's lock; ByteTrack keeps its own tracks, so track IDs keep counting up. A webcam that freezes without reporting an error (rather than disconnecting) isn't detected.
 
 ## Files
 
@@ -229,6 +256,10 @@ To compare settings fairly, record a few clips with `record.py` and run each set
 | --- | --- |
 | `main.py` | The program: detection, tracking, measurements and the main loop |
 | `hud.py` | All HUD drawing |
+| `screen.py` | Windows helpers: monitors, full screen, keep-awake, startup time |
+| `demo.bat` / `demo_backup.bat` | Demo launchers (live webcam / looping backup clip) |
+| `demo_clip.mp4` | The backup clip (record it with `record.py`; not in Git) |
+| `demo_error.log` | Crash details from demo mode, if any (not in Git) |
 | `record.py` | Records test clips from the webcam |
 | `requirements.txt` | Python packages with tested versions |
 | `NOTES.md` | Development notes and answers for each milestone |

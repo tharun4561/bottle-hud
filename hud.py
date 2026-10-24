@@ -6,10 +6,10 @@ the status line and the debug overlay. main.py does the detection, tracking
 and math, then hands the results to Hud.render() as plain values (numbers,
 strings and boxes), so it doesn't matter which code produced them.
 
-The camera frame is scaled up to DISPLAY_SIZE first and everything is drawn
-at that size, so text and lines stay sharp in full screen. Sizes are
-fractions of the display height, so the HUD keeps its proportions at any
-DISPLAY_SIZE.
+The camera frame is scaled up to the display size (DISPLAY_SIZE, or the
+screen's own size in full screen) first and everything is drawn at that
+size, so text and lines stay sharp. Sizes are fractions of the display
+height, so the HUD keeps its proportions at any display size.
 """
 
 import time  # high-precision clock for blinking and the draw timing
@@ -28,13 +28,17 @@ LOST_GRACE_S = 0.2
 LOST_HOLD_S = 2.0
 
 DEBUG_DEFAULT = False  # whether the debug overlay starts switched on
+LEGEND_SECONDS = 8.0  # how long the key legend shows after the first frame
 
 # Display.
-DISPLAY_SIZE = (1920, 1080)  # (width, height) to draw at; match the screen
-# If scaling the frame up leaves a strip beside it at least this wide (as a
-# fraction of the display width), the panel goes in the strip instead of
-# covering the video. A 4:3 webcam on a 16:9 screen leaves 25%.
-MIN_STRIP_FRACTION = 0.18
+DISPLAY_SIZE = (1920, 1080)  # (width, height) to draw at outside full screen
+# The panel goes in a strip beside the video at least this wide (as a
+# fraction of the display width), so it doesn't cover the video. A 4:3
+# webcam on a 16:9 screen leaves 25% anyway; on a 16:10 screen the video is
+# shrunk a little to make room. If that would shrink the video to less than
+# MIN_VIDEO_SCALE of its full size, the panel covers the video instead.
+PANEL_STRIP_FRACTION = 0.2
+MIN_VIDEO_SCALE = 0.85
 OVERLAY_PANEL_WIDTH = 0.24  # panel width when it has to cover the video
 MARGIN = 0.02  # gap between HUD elements and the edges
 
@@ -78,6 +82,7 @@ BLACK = (0, 0, 0)
 PANEL_ALPHA = 0.8
 BANNER_ALPHA = 0.6
 DEBUG_ALPHA = 0.65
+LEGEND_ALPHA = 0.5  # the key legend stays unobtrusive
 
 BLINK_PERIOD_S = 0.5  # one on/off cycle of the LOST blink, in seconds
 TIMING_SMOOTHING = 0.1  # EMA factor for the stage timings in the debug overlay
@@ -123,19 +128,25 @@ class LockIndicator:
         # Nothing locked. An untracked detection is still shown, as a candidate.
         return SEARCHING, box, track_id, conf
 
+    def reset(self):
+        # Forget the locked target, so the state is SEARCHING until a target
+        # is locked again.
+        self.last = None
+        self.last_seen = None
 
-def px(fraction):
+
+def px(fraction, display_h):
     # A size given as a fraction of the display height, in whole pixels
     # (at least 1).
-    return max(1, round(fraction * DISPLAY_SIZE[1]))
+    return max(1, round(fraction * display_h))
 
 
-def text_style(fraction):
+def text_style(fraction, display_h):
     # Font scale and stroke thickness for text whose capital letters are
     # this fraction of the display height tall. Thicker strokes for bigger
     # text keep it bold enough to read on a projector.
     (_, base_h), _ = cv2.getTextSize("0", FONT, 1.0, 1)
-    height = fraction * DISPLAY_SIZE[1]
+    height = fraction * display_h
     return height / base_h, max(2, round(height / 12))
 
 
@@ -222,12 +233,12 @@ def rects_overlap(a, b):
     return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
 
 
-def draw_brackets(img, rect, color, thickness):
+def draw_brackets(img, rect, color, thickness, min_arm):
     # Corner brackets around a rectangle (x1, y1, x2, y2): an L at each
     # corner instead of a full box, so the object itself stays visible.
+    # min_arm is the shortest arm length, in pixels.
     x1, y1, x2, y2 = rect
-    arm = max(px(MIN_BRACKET_LENGTH),
-              round(BRACKET_LENGTH * min(x2 - x1, y2 - y1)))
+    arm = max(min_arm, round(BRACKET_LENGTH * min(x2 - x1, y2 - y1)))
     # Each corner, and which way its two arms point (+1 or -1 in x and y).
     for x, y, sx, sy in ((x1, y1, 1, 1), (x2, y1, -1, 1),
                          (x1, y2, 1, -1), (x2, y2, -1, -1)):
@@ -262,35 +273,63 @@ def box_label(track_id, conf):
 
 
 class Hud:
-    """Draws the HUD. Holds the settings that last between frames (the debug
-    toggle and the smoothed stage timings)."""
+    """Draws the HUD. Holds the settings that last between frames (display
+    size, debug and legend toggles, and the smoothed stage timings)."""
 
-    def __init__(self, target_name):
+    def __init__(self, target_name, keys=(), display_size=DISPLAY_SIZE):
         # target_name: the class being tracked, e.g. "bottle", shown on the
         # banner and next to the target.
+        # keys: (key, action) pairs for the key legend, e.g. ("q", "quit").
+        # display_size: (width, height) of the image render() returns.
         self.target_name = target_name.upper()
+        self.keys = list(keys)
         self.show_debug = DEBUG_DEFAULT
+        # The legend shows until legend_until (perf_counter seconds; set by
+        # the first render), or all the time once h turns it on.
+        self.legend_until = None
+        self.legend_on = False
         self.timings = {}  # smoothed stage timings in seconds, by name
         self.draw_time = None  # how long the previous render() took
-
-        self.banner_style = text_style(BANNER_TEXT)
-        self.value_style = text_style(VALUE_TEXT)
-        self.status_style = text_style(STATUS_TEXT)
-        self.label_style = text_style(LABEL_TEXT)
-        self.debug_style = text_style(DEBUG_TEXT)
+        self.set_display_size(display_size)
 
         # Set by layout() for each frame.
         self.scale = 1.0  # display pixels per frame pixel
         self.video = (0, 0, 0, 0)  # the video's rectangle on the display
         self.strip = None  # the empty strip beside the video, or None
+        self.free = (0, 0)  # (left, right) of the video not under the panel
+
+    def set_display_size(self, display_size):
+        # Draw at a new size from now on, e.g. the screen's own size in full
+        # screen, so nothing gets scaled again after drawing.
+        self.display_size = display_size
+        display_h = display_size[1]
+        self.banner_style = text_style(BANNER_TEXT, display_h)
+        self.value_style = text_style(VALUE_TEXT, display_h)
+        self.status_style = text_style(STATUS_TEXT, display_h)
+        self.label_style = text_style(LABEL_TEXT, display_h)
+        self.debug_style = text_style(DEBUG_TEXT, display_h)
+
+    def px(self, fraction):
+        # A size given as a fraction of the display height, in pixels.
+        return px(fraction, self.display_size[1])
 
     def toggle_debug(self):
         self.show_debug = not self.show_debug
 
+    def legend_visible(self):
+        return self.legend_on or (self.legend_until is not None
+                                  and time.perf_counter() < self.legend_until)
+
+    def toggle_legend(self):
+        # Hide the legend if it's showing (even during the first seconds),
+        # otherwise show it until h is pressed again.
+        self.legend_on = not self.legend_visible()
+        self.legend_until = 0.0
+
     def render(self, frame, *, state, box, track_id, conf, others, lead,
                distance_text, bearing, intercept_text, fps, mode, status,
                debug_rows, timings):
-        """Return a new image, DISPLAY_SIZE big, with the frame and the HUD.
+        """Return a new image, display_size big, with the frame and the HUD.
 
         frame is not changed. Positions and boxes are in frame pixels.
 
@@ -309,6 +348,8 @@ class Hud:
         timings: (name, seconds) pairs of stage timings for the debug overlay
         """
         start = time.perf_counter()
+        if self.legend_until is None:
+            self.legend_until = start + LEGEND_SECONDS
         canvas = self.layout(frame)
 
         # LOST blinks: on for the first half of each period, off for the second.
@@ -327,9 +368,10 @@ class Hud:
             ("MODE", mode),
         ])]
 
+        min_arm = self.px(MIN_BRACKET_LENGTH)
         for other_box, _, _ in others:
             draw_brackets(canvas, self.to_rect(other_box), CANDIDATE_COLOR,
-                          px(CANDIDATE_THICKNESS))
+                          self.px(CANDIDATE_THICKNESS), min_arm)
 
         origin = self.origin()
         lead_on_screen = True
@@ -338,14 +380,14 @@ class Hud:
             if state == SEARCHING:
                 # A detection that isn't tracked yet: a candidate, not a lock.
                 draw_brackets(canvas, target_rect, SEARCHING_COLOR,
-                              px(CANDIDATE_THICKNESS))
+                              self.px(CANDIDATE_THICKNESS), min_arm)
             else:
                 if state == LOCKED:
                     self.draw_target_line(canvas, origin, target_rect)
                 if state == LOCKED or blink_on:
                     color = STATE_COLORS[state]
                     draw_brackets(canvas, target_rect, color,
-                                  px(BRACKET_THICKNESS))
+                                  self.px(BRACKET_THICKNESS), min_arm)
                     avoid.append(self.draw_target_name(canvas, target_rect,
                                                        track_id, color))
 
@@ -361,6 +403,8 @@ class Hud:
         avoid.append(banner_rect)
         if status:
             avoid.append(self.draw_status(canvas, status, banner_rect[3]))
+        if self.keys and self.legend_visible():
+            avoid.append(self.draw_legend(canvas))
 
         # Smooth the stage timings even while the overlay is hidden, so
         # they're settled when it's switched on.
@@ -377,8 +421,6 @@ class Hud:
             rows.append(("LEAD", "on screen" if lead_on_screen else "off screen"))
             for name, seconds in self.timings.items():
                 rows.append((name, f"{seconds * 1000:.1f} ms"))
-            rows.append(("keys", "c calibrate  +/- speed  d debug  "
-                                 "f full screen  q quit"))
             avoid.append(self.draw_debug(canvas, rows))
             # Box labels last, so nothing covers them.
             if box is not None:
@@ -392,24 +434,36 @@ class Hud:
         return canvas
 
     def layout(self, frame):
-        # Scale the frame up to fit DISPLAY_SIZE and return it on a black
+        # Scale the frame to fit the display size and return it on a black
         # canvas of that size. Records where the video landed.
-        disp_w, disp_h = DISPLAY_SIZE
+        disp_w, disp_h = self.display_size
         frame_h, frame_w = frame.shape[:2]
-        self.scale = min(disp_w / frame_w, disp_h / frame_h)
-        video_w = round(frame_w * self.scale)
-        video_h = round(frame_h * self.scale)
+        full_scale = min(disp_w / frame_w, disp_h / frame_h)
+        # The biggest scale that still leaves room for the panel's strip.
+        strip_scale = min(disp_w * (1 - PANEL_STRIP_FRACTION) / frame_w,
+                          disp_h / frame_h)
 
-        # With a wide enough strip left over, put the video on the left and
-        # keep the strip for the panel; otherwise center the video.
-        if disp_w - video_w >= MIN_STRIP_FRACTION * disp_w:
+        # If the strip costs little, put the video on the left and the panel
+        # in the strip; otherwise center the video and cover it with the
+        # panel. self.free is the part of the video the banner and status
+        # line are centered in (left of the panel when it covers the video).
+        if strip_scale >= MIN_VIDEO_SCALE * full_scale:
+            self.scale = strip_scale
+            video_w = round(frame_w * self.scale)
             left = 0
             self.strip = (video_w, 0, disp_w, disp_h)
+            free_right = video_w
         else:
+            self.scale = full_scale
+            video_w = round(frame_w * self.scale)
             left = (disp_w - video_w) // 2
             self.strip = None
+            free_right = (left + video_w - 2 * self.px(MARGIN)
+                          - round(OVERLAY_PANEL_WIDTH * disp_w))
+        video_h = round(frame_h * self.scale)
         top = (disp_h - video_h) // 2
         self.video = (left, top, left + video_w, top + video_h)
+        self.free = (left, free_right)
 
         # INTER_LINEAR is a smooth, fast upscale; the HUD is drawn
         # afterwards, so its text and lines aren't blurred by it.
@@ -432,12 +486,12 @@ class Hud:
         # The launcher crosshair: bottom center of the video, where both
         # lines start.
         x1, _, x2, y2 = self.video
-        return ((x1 + x2) // 2, y2 - px(CROSSHAIR_BOTTOM_MARGIN))
+        return ((x1 + x2) // 2, y2 - self.px(CROSSHAIR_BOTTOM_MARGIN))
 
     def draw_crosshair(self, img, origin):
         x, y = origin
-        size = px(CROSSHAIR_SIZE)
-        thickness = px(LINE_THICKNESS)
+        size = self.px(CROSSHAIR_SIZE)
+        thickness = self.px(LINE_THICKNESS)
         cv2.line(img, (x - size, y), (x + size, y), CROSSHAIR_COLOR,
                  thickness, cv2.LINE_AA)
         cv2.line(img, (x, y - size), (x, y + size), CROSSHAIR_COLOR,
@@ -446,9 +500,9 @@ class Hud:
     def draw_target_line(self, img, origin, rect):
         # Line from the crosshair to the target's center, plus a dot there.
         center = ((rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2)
-        cv2.line(img, origin, center, TARGET_LINE_COLOR, px(LINE_THICKNESS),
-                 cv2.LINE_AA)
-        cv2.circle(img, center, px(DOT_RADIUS), TARGET_LINE_COLOR, -1,
+        cv2.line(img, origin, center, TARGET_LINE_COLOR,
+                 self.px(LINE_THICKNESS), cv2.LINE_AA)
+        cv2.circle(img, center, self.px(DOT_RADIUS), TARGET_LINE_COLOR, -1,
                    cv2.LINE_AA)
 
     def draw_lead_line(self, img, origin, lead):
@@ -456,12 +510,12 @@ class Hud:
         # there. Returns True if the point is on the video, False if not.
         end = self.to_display(lead[0], lead[1])
         x1, y1, x2, y2 = self.video
-        thickness = px(LINE_THICKNESS)
+        thickness = self.px(LINE_THICKNESS)
 
         if x1 <= end[0] < x2 and y1 <= end[1] < y2:
             cv2.line(img, origin, end, LEAD_COLOR, thickness, cv2.LINE_AA)
             # Reticle: a circle with a cross through it reads as "aim here".
-            r = px(AIM_RADIUS)
+            r = self.px(AIM_RADIUS)
             arm = round(r * 1.6)
             cv2.circle(img, end, r, LEAD_COLOR, thickness, cv2.LINE_AA)
             cv2.line(img, (end[0] - arm, end[1]), (end[0] + arm, end[1]),
@@ -478,8 +532,8 @@ class Hud:
         if inside:
             cv2.line(img, start, edge, LEAD_COLOR, thickness, cv2.LINE_AA)
             # A hollow circle at the edge means "the point is beyond here".
-            cv2.circle(img, edge, px(DOT_RADIUS) + 3, LEAD_COLOR, thickness,
-                       cv2.LINE_AA)
+            cv2.circle(img, edge, self.px(DOT_RADIUS) + 3, LEAD_COLOR,
+                       thickness, cv2.LINE_AA)
         return False
 
     def draw_target_name(self, img, rect, track_id, color):
@@ -489,7 +543,7 @@ class Hud:
         if track_id is not None:
             text += f" #{track_id}"
         style = self.label_style
-        gap = px(0.01)
+        gap = self.px(0.01)
         y = rect[1] - gap
         if y - cap_height(style) < self.video[1]:
             y = rect[3] + gap + cap_height(style)
@@ -510,19 +564,21 @@ class Hud:
                 text += f" #{track_id}"
         color = STATE_COLORS[state]
 
-        margin = px(MARGIN)
-        max_w = (self.video[2] - self.video[0]) - 4 * margin
+        margin = self.px(MARGIN)
+        left, right = self.free
+        max_w = (right - left) - 4 * margin
         style = fit_style(text, self.banner_style, max_w)
         text_h = cap_height(style)
         lamp_r = text_h // 3
         pad = text_h // 2
         width = 2 * lamp_r + pad + text_width(text, style) + 2 * pad
-        x1 = (self.video[0] + self.video[2] - width) // 2
+        x1 = (left + right - width) // 2
         y1 = self.video[1] + margin
         rect = (x1, y1, x1 + width, y1 + text_h + 2 * pad)
 
         blend_rect(img, rect, BLACK, BANNER_ALPHA)
-        cv2.rectangle(img, rect[:2], rect[2:], color, px(0.003), cv2.LINE_AA)
+        cv2.rectangle(img, rect[:2], rect[2:], color, self.px(0.003),
+                      cv2.LINE_AA)
         lamp = (x1 + pad + lamp_r, y1 + pad + text_h // 2)
         # The lamp blinks when LOST; the word itself stays steady to read.
         if state != LOST or blink_on:
@@ -534,13 +590,14 @@ class Hud:
     def draw_status(self, img, status, below):
         # The status line, centered under the banner (whose bottom is at y =
         # below). Returns its rectangle.
-        margin = px(MARGIN)
-        max_w = (self.video[2] - self.video[0]) - 4 * margin
+        margin = self.px(MARGIN)
+        left, right = self.free
+        max_w = (right - left) - 4 * margin
         style = fit_style(status, self.status_style, max_w)
         text_h = cap_height(style)
         pad = text_h // 2
         width = text_width(status, style) + 2 * pad
-        x1 = (self.video[0] + self.video[2] - width) // 2
+        x1 = (left + right - width) // 2
         y1 = below + margin // 2
         rect = (x1, y1, x1 + width, y1 + text_h + 2 * pad)
         blend_rect(img, rect, BLACK, BANNER_ALPHA)
@@ -554,7 +611,7 @@ class Hud:
         # there is one, otherwise top right on the video over a dark
         # background. Returns the rectangle it covers on the video (empty in
         # the strip, since there's nothing to avoid there).
-        margin = px(MARGIN)
+        margin = self.px(MARGIN)
         label_h = cap_height(self.label_style)
         value_h = cap_height(self.value_style)
         label_gap = label_h // 2  # between a label and its value
@@ -568,7 +625,7 @@ class Hud:
             covered = (0, 0, 0, 0)
         else:
             x2 = self.video[2] - margin
-            x1 = x2 - round(OVERLAY_PANEL_WIDTH * DISPLAY_SIZE[0])
+            x1 = x2 - round(OVERLAY_PANEL_WIDTH * self.display_size[0])
             y1 = self.video[1] + margin
             covered = (x1, y1, x2, y1 + height)
             blend_rect(img, covered, BLACK, PANEL_ALPHA)
@@ -577,8 +634,8 @@ class Hud:
         max_w = x2 - margin - text_x
         y = y1 + margin
         for label, value in rows:
-            put_text(img, label, (text_x, y + label_h), self.label_style,
-                     LABEL_COLOR)
+            put_text(img, label, (text_x, y + label_h),
+                     fit_style(label, self.label_style, max_w), LABEL_COLOR)
             y += label_h + label_gap
             style = fit_style(value, self.value_style, max_w)
             color = MISSING_COLOR if value == "--" else VALUE_COLOR
@@ -587,8 +644,20 @@ class Hud:
         return covered
 
     def draw_debug(self, img, rows):
-        # The debug overlay: small (label, value) rows, bottom left of the
-        # video, over a dark background. Returns its rectangle.
+        # The debug overlay: (label, value) rows, bottom left of the video.
+        return self.draw_table(img, rows, False, DEBUG_ALPHA, LABEL_COLOR,
+                               VALUE_COLOR)
+
+    def draw_legend(self, img):
+        # The key legend: (key, action) rows, bottom right of the video, on
+        # a lighter background so it stays in the background.
+        return self.draw_table(img, self.keys, True, LEGEND_ALPHA,
+                               VALUE_COLOR, LABEL_COLOR)
+
+    def draw_table(self, img, rows, right, alpha, left_color, right_color):
+        # Small two-column text rows in a bottom corner of the video (right
+        # corner if right is True), over a dark background. Returns its
+        # rectangle.
         style = self.debug_style
         text_h = cap_height(style)
         line_h = round(text_h * 1.6)
@@ -598,16 +667,19 @@ class Hud:
         width += 2 * pad
         height = len(rows) * line_h + 2 * pad - (line_h - text_h)
 
-        margin = px(MARGIN)
-        x1 = self.video[0] + margin
+        margin = self.px(MARGIN)
+        if right:
+            x1 = self.video[2] - margin - width
+        else:
+            x1 = self.video[0] + margin
         y2 = self.video[3] - margin
         rect = (x1, y2 - height, x1 + width, y2)
-        blend_rect(img, rect, BLACK, DEBUG_ALPHA)
+        blend_rect(img, rect, BLACK, alpha)
 
         y = rect[1] + pad + text_h
         for label, value in rows:
-            put_text(img, label, (x1 + pad, y), style, LABEL_COLOR)
-            put_text(img, value, (x1 + pad + value_x, y), style, VALUE_COLOR)
+            put_text(img, label, (x1 + pad, y), style, left_color)
+            put_text(img, value, (x1 + pad + value_x, y), style, right_color)
             y += line_h
         return rect
 

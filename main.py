@@ -8,13 +8,17 @@ lead line to the predicted aim point.
 Usage:
     .venv\\Scripts\\python.exe main.py                     (webcam)
     .venv\\Scripts\\python.exe main.py --video clip.mp4    (recorded file)
+    .venv\\Scripts\\python.exe main.py --demo              (full screen demo)
+Run with --help for all the options; demo.bat and demo_backup.bat start
+the demo with a double-click.
 
 Press c to calibrate (press c again to cancel; webcam only).
-Press + / - to change the interceptor speed.
-Press d to show or hide the debug overlay, f to switch full screen.
-Press q (or close the window) to quit.
+Press + / - to change the interceptor speed, r to reset the lock.
+Press d for the debug overlay, h for the key legend, f for full screen.
+Press q (or close the window) to quit; twice in demo mode.
 
-The drawing is in hud.py; this file does the detection, tracking and math.
+The drawing is in hud.py and the Windows screen helpers in screen.py; this
+file does the detection, tracking and math.
 """
 
 import argparse  # reading command-line options like --video
@@ -22,18 +26,31 @@ import json  # reading and writing calibration.json
 import math  # math functions for the bearing formula and the intercept
 import sys  # used to exit the program with an error code
 import time  # high-precision clock for FPS and webcam timestamps
+import traceback  # saving crash details to a file in demo mode
 from collections import deque  # a list that's quick to trim from the front
 from datetime import datetime  # timestamp saved with the calibration
 from pathlib import Path  # building file paths that work on any OS
 
 import cv2  # OpenCV: camera access, windows, and image drawing
+import numpy as np  # a black frame for the model warm-up
 from ultralytics import YOLO  # Ultralytics: loads and runs YOLO models
 
 import hud  # all the HUD drawing
+import screen  # monitors, full screen and keep-awake on Windows
 
 CAMERA_INDEX = 0  # 0 = the first camera Windows finds (the built-in webcam)
+# Windows' DirectShow opens the webcam in about 1 s; the default backend
+# (Media Foundation) took about 9 s here. The default is still tried if
+# DirectShow can't open the camera.
+CAMERA_BACKEND = cv2.CAP_DSHOW
 WINDOW_NAME = "Interceptor HUD"  # the title shown on the window
 WINDOW_SIZE = (1280, 720)  # starting window size; the HUD itself is bigger
+
+# Demo mode.
+QUIT_CONFIRM_S = 3.0  # in demo mode, q must be pressed twice within this
+RECONNECT_INTERVAL_S = 1.0  # how often to try reopening a lost webcam
+# Crash details in demo mode, next to main.py.
+ERROR_LOG_PATH = Path(__file__).parent / "demo_error.log"
 
 MODEL_PATH = "yolo26n.pt"  # YOLO26 nano; downloaded automatically on first run
 TARGET_CLASS = "bottle"  # the only class we want to show
@@ -430,7 +447,7 @@ def load_calibration():
             data = json.load(f)
         focal_length = float(data["focal_length_px"])
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-        print(f"Warning: could not read {CALIBRATION_PATH}; press c to recalibrate.")
+        print(f"WARN: could not read {CALIBRATION_PATH}")
         return None, None
 
     # The frame size is optional, so a missing or odd value just means
@@ -469,7 +486,224 @@ def parse_args(argv):
     parser.add_argument(
         "--video", metavar="PATH",
         help="run on a recorded video file instead of the webcam")
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--loop", action="store_true",
+        help="with --video: start the video again when it ends")
+    parser.add_argument(
+        "--demo", action="store_true",
+        help="demo mode: full screen, q twice to quit, keep the laptop "
+             "awake, never download the model")
+    parser.add_argument(
+        "--model", metavar="PATH", default=MODEL_PATH,
+        help=f"YOLO model file (default: {MODEL_PATH} in the project folder)")
+    parser.add_argument(
+        "--screen", metavar="N", type=int, nargs="?", const=0,
+        help="put the window on monitor N (1 = the main one); without N, "
+             "list the monitors")
+    args = parser.parse_args(argv)
+    if args.loop and args.video is None:
+        parser.error("--loop only works with --video")
+    return args
+
+
+def model_file(path):
+    # A relative model path is taken from main.py's folder (like
+    # calibration.json), so the model is found no matter which folder the
+    # program is started from.
+    path = Path(path)
+    return path if path.is_absolute() else Path(__file__).parent / path
+
+
+def key_legend(video_mode, demo):
+    # The keys for the on-screen legend, as (key, action) pairs, matching
+    # what the key handling in main() does.
+    keys = [] if video_mode else [("c", "calibrate")]
+    keys += [
+        ("+ / -", "interceptor speed"),
+        ("r", "reset lock"),
+        ("d", "debug overlay"),
+        ("f", "full screen"),
+        ("h", "show/hide keys"),
+        ("q", "quit (press twice)" if demo else "quit"),
+    ]
+    return keys
+
+
+def open_camera():
+    # Open the webcam: DirectShow first (fast on Windows), then the default
+    # backend. Returns the capture, or None if neither works.
+    for backend in (CAMERA_BACKEND, cv2.CAP_ANY):
+        cap = cv2.VideoCapture(CAMERA_INDEX, backend)
+        if cap.isOpened():
+            return cap
+        cap.release()
+    return None
+
+
+def preflight(args, model_path):
+    """Check everything the program needs before the window opens.
+
+    Prints one line per problem ("FAIL: ..." or "WARN: ...") and exits if
+    anything essential is missing, so nothing goes wrong later in front of
+    an audience. Returns (cap, first_frame, focal_length, calibration_size,
+    size_warning): the opened camera or video and its first frame, the
+    calibration (None, None if there isn't one), and a status line message
+    if the frame size doesn't match the calibration (or None).
+    """
+    failures = 0
+    video_mode = args.video is not None
+
+    if not model_path.is_file():
+        if args.demo:
+            print(f"FAIL: model file not found: {model_path} (demo mode never "
+                  "downloads it; copy it into the project folder)")
+            failures += 1
+        else:
+            print(f"WARN: model file not found: {model_path}; Ultralytics "
+                  "will try to download it")
+
+    focal_length, calibration_size = load_calibration()
+    if focal_length is None:
+        print(f"WARN: not calibrated: hold the {TARGET_CLASS} at "
+              f"{KNOWN_DISTANCE_M:.2f} m and press c")
+
+    # The camera or video file, and its first frame (needed to check the
+    # frame size).
+    cap = None
+    frame = None
+    if video_mode:
+        if not Path(args.video).is_file():
+            print(f"FAIL: video file not found: {args.video}")
+            failures += 1
+        else:
+            cap = cv2.VideoCapture(args.video)
+            if not cap.isOpened():
+                print(f"FAIL: could not open the video file: {args.video}")
+                failures += 1
+    else:
+        cap = open_camera()
+        if cap is None:
+            print("FAIL: could not open the webcam (close Zoom, Teams or "
+                  "browser tabs using it, and check Settings > Privacy > "
+                  "Camera); the backup is demo_backup.bat")
+            failures += 1
+
+    if cap is not None and cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            frame = None
+            source = "video file" if video_mode else "webcam"
+            print(f"FAIL: the {source} opened but gives no frames")
+            failures += 1
+
+    # The focal length in pixels only fits the resolution it was
+    # calibrated at.
+    size_warning = None
+    if frame is not None and calibration_size is not None:
+        frame_size = (frame.shape[1], frame.shape[0])  # (width, height)
+        if frame_size != calibration_size:
+            size_warning = (f"Warning: {frame_size[0]}x{frame_size[1]}, "
+                            f"calibrated at {calibration_size[0]}x"
+                            f"{calibration_size[1]}")
+            print(f"WARN: frames are {frame_size[0]}x{frame_size[1]} but the "
+                  f"calibration was made at {calibration_size[0]}x"
+                  f"{calibration_size[1]}; distances will be wrong until you "
+                  "recalibrate")
+
+    if failures:
+        if cap is not None:
+            cap.release()
+        print(f"Pre-flight check failed ({failures} problem"
+              f"{'s' if failures > 1 else ''}); not starting.")
+        sys.exit(1)
+
+    return cap, frame, focal_length, calibration_size, size_warning
+
+
+class QuitKey:
+    """q quits at once, or in demo mode only when pressed twice within
+    QUIT_CONFIRM_S, so one stray key press can't end the demo."""
+
+    def __init__(self, confirm):
+        self.confirm = confirm  # True: needs a second press
+        self.first_press = None  # when q was pressed first (perf_counter)
+
+    def press(self):
+        # Returns True to quit now, False to wait for a second press.
+        now = time.perf_counter()
+        if (not self.confirm or (self.first_press is not None
+                                 and now - self.first_press < QUIT_CONFIRM_S)):
+            return True
+        self.first_press = now
+        return False
+
+
+def toggle_fullscreen(display, monitor=None):
+    # Switch the window between full screen and normal. In full screen the
+    # HUD is drawn at the screen's own size, so it's shown pixel for pixel.
+    # monitor: the screen to fill, or None for the one the window is on.
+    if screen.is_fullscreen(WINDOW_NAME):
+        screen.set_fullscreen(WINDOW_NAME, False)
+        display.set_display_size(hud.DISPLAY_SIZE)
+    else:
+        size = screen.set_fullscreen(WINDOW_NAME, True, monitor)
+        if size is not None:
+            display.set_display_size(size)
+
+
+def handle_view_keys(key, display):
+    # The keys that only change the view, the same in every situation:
+    # d (debug overlay), h (key legend) and f (full screen).
+    if key == ord("d"):
+        display.toggle_debug()
+    if key == ord("h"):
+        display.toggle_legend()
+    if key == ord("f"):
+        toggle_fullscreen(display)
+
+
+def window_closed():
+    # True if the user closed the window with the X button.
+    return cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1
+
+
+def reconnect_camera(display, last_frame, quit_key):
+    """Keep trying to reopen a lost webcam, with the window still working.
+
+    Shows the last frame with a "camera lost" message and tries the camera
+    again every RECONNECT_INTERVAL_S. Returns (cap, frame) once it's back,
+    or (None, None) if the user quits or closes the window meanwhile.
+    """
+    print("Camera lost; trying to reconnect (q to quit).")
+    status = "Camera lost: reconnecting..."
+    next_try = time.perf_counter()
+    while True:
+        if time.perf_counter() >= next_try:
+            cap = open_camera()
+            if cap is not None:
+                ret, frame = cap.read()
+                if ret:
+                    print("Camera reconnected.")
+                    return cap, frame
+                cap.release()
+            next_try = time.perf_counter() + RECONNECT_INTERVAL_S
+
+        image = display.render(
+            last_frame, state=hud.SEARCHING, box=None, track_id=None,
+            conf=None, others=[], lead=None, distance_text="--",
+            bearing=None, intercept_text="--", fps=None, mode="LIVE",
+            status=status, debug_rows=[("camera", "reconnecting")],
+            timings=[])
+        cv2.imshow(WINDOW_NAME, image)
+        key = cv2.waitKey(50) & 0xFF
+
+        if key == ord("q"):
+            if quit_key.press():
+                return None, None
+            status = "Camera lost: press q again to quit"
+        handle_view_keys(key, display)
+        if window_closed():
+            return None, None
 
 
 def video_time(cap, last_t):
@@ -517,17 +751,65 @@ def print_video_summary(stats):
         print(f"  {label:<29}{value}")  # :<29 pads labels to line up
 
 
+def report_startup(launch_s, main_start, camera_done, model_done,
+                   warmup_done):
+    # Print how long it took from launch to the first frame on screen, and
+    # where the time went. launch_s is how long Python and the imports took
+    # before main() started (None if unknown); the rest are perf_counter
+    # times of each step's end.
+    now = time.perf_counter()
+    parts = [("checks + camera", camera_done - main_start),
+             ("model", model_done - camera_done),
+             ("warm-up", warmup_done - model_done),
+             ("window", now - warmup_done)]
+    total = now - main_start
+    if launch_s is not None:
+        parts.insert(0, ("Python + imports", launch_s))
+        total += launch_s
+    details = ", ".join(f"{name} {seconds:.1f} s" for name, seconds in parts)
+    print(f"Ready in {total:.1f} s ({details})")
+
+
 def main(argv=None):
+    # How long Python and the imports took, for the startup report.
+    launch_s = screen.seconds_since_launch()
+    main_start = time.perf_counter()
+
+    # Before any window exists, so full screen uses real pixels.
+    screen.make_dpi_aware()
+
     args = parse_args(argv)
     video_mode = args.video is not None
 
-    # Check the video file before the slow model load, so a typo fails fast.
-    if video_mode and not Path(args.video).is_file():
-        print(f"Error: video file not found: {args.video}")
-        sys.exit(1)
+    # --screen: which monitor the window goes on (None = wherever Windows
+    # puts it). --screen without a number just lists the monitors.
+    monitor = None
+    if args.screen is not None:
+        monitors = screen.list_monitors()
+        if not 1 <= args.screen <= len(monitors):
+            if args.screen != 0:
+                print(f"Error: there is no screen {args.screen}.")
+            for i, (x, y, w, h, primary) in enumerate(monitors, start=1):
+                print(f"Screen {i}: {w}x{h} at ({x}, {y})"
+                      f"{' (main)' if primary else ''}")
+            sys.exit(0 if args.screen == 0 else 1)
+        monitor = monitors[args.screen - 1]
+
+    # Pre-flight checks: model file, calibration, camera or video file.
+    # Also opens the camera (or file) and reads its first frame.
+    model_path = model_file(args.model)
+    cap, first_frame, focal_length, calibration_size, size_warning = (
+        preflight(args, model_path))
+    camera_done = time.perf_counter()
 
     # Load the model once, before the loop (loading is slow).
-    model = YOLO(MODEL_PATH)
+    try:
+        model = YOLO(str(model_path))
+    except Exception as error:  # any problem with the file
+        print(f"FAIL: could not load the model {model_path}: {error}")
+        cap.release()
+        sys.exit(1)
+    model_done = time.perf_counter()
 
     # model.names maps each class ID to its name, e.g. {39: 'bottle', ...}.
     # Look up the ID for our target class instead of hardcoding the number.
@@ -538,17 +820,28 @@ def main(argv=None):
             break
 
     if bottle_id is None:
-        print(f"Error: the model has no class named '{TARGET_CLASS}'.")
+        print(f"FAIL: the model has no class named '{TARGET_CLASS}'.")
+        cap.release()
         sys.exit(1)
 
-    # Load a saved focal length (None if we haven't calibrated yet) and the
-    # frame size it was made with (None if the file doesn't say).
-    focal_length, calibration_size = load_calibration()
-    if focal_length is None:
-        print(f"Not calibrated yet. Hold the {TARGET_CLASS} at "
-              f"{KNOWN_DISTANCE_M:.2f} m and press c.")
+    # Warm-up: YOLO's first run takes seconds (PyTorch sets itself up), so
+    # do it now, on a black frame the size of the camera's, instead of
+    # freezing the first live frame. Same settings as the tracking call.
+    model.track(np.zeros_like(first_frame), persist=True,
+                tracker=TRACKER_CONFIG, conf=CONF_THRESHOLD, imgsz=IMGSZ,
+                verbose=False)
+    warmup_done = time.perf_counter()
+
+    height, width = first_frame.shape[:2]
+    if video_mode:
+        source = f"video {args.video} {width}x{height}"
     else:
-        print(f"Loaded focal length: {focal_length:.1f} px")
+        source = f"camera {width}x{height} ({cap.getBackendName()})"
+    if focal_length is None:
+        calibration_text = "not calibrated"
+    else:
+        calibration_text = f"f {focal_length:.1f} px"
+    print(f"OK: {source}, model {model_path.name}, {calibration_text}")
 
     # Calibration state.
     calibrating = False  # True while we're collecting samples
@@ -560,8 +853,10 @@ def main(argv=None):
     smoothed_h = None  # running EMA of h; None until there's a bottle to track
 
     # The HUD, and the lock state it shows (SEARCHING / LOCKED / LOST).
-    display = hud.Hud(TARGET_CLASS)
+    keys = key_legend(video_mode, args.demo)
+    display = hud.Hud(TARGET_CLASS, keys=keys)
     lock = hud.LockIndicator()
+    quit_key = QuitKey(confirm=args.demo)
 
     # Tracking and velocity state.
     locked_id = None  # track ID of the bottle we're following
@@ -571,46 +866,54 @@ def main(argv=None):
     # the oldest sample automatically, so it always holds the last N.
     history_3d = deque(maxlen=VELOCITY_WINDOW)
 
+    def reset_lock():
+        # Forget the target we're following, so the most confident one is
+        # picked again on the next frame (the r key, and each video loop).
+        # nonlocal: these are main()'s variables, not new ones.
+        nonlocal locked_id, history_id, last_seen, smoothed_h
+        locked_id = None
+        history_id = None
+        last_seen = None
+        smoothed_h = None
+        history_3d.clear()
+        lock.reset()
+
     # FPS state.
     frame_time = None  # smoothed seconds per loop pass; None until measured
     last_loop_start = None  # when the previous loop pass started
     frame_count = 0  # loop passes so far
 
     frame_t = None  # timestamp of the current frame, in seconds
-    size_checked = False  # whether the frame size was compared yet
+    # For a video: the file's own time of the current frame, and how much
+    # to add to it so time keeps counting up when --loop starts it again.
+    file_t = None
+    loop_offset = 0.0
+    pending_frame = first_frame  # read by the pre-flight check, not used yet
+    last_frame = first_frame  # shown while the webcam reconnects
 
     # Counts for the end-of-video summary. timing_start is when the first
     # frame after the warm-up began processing.
     stats = {"frames": 0, "tracked_frames": 0, "track_ids": set(),
              "video_seconds": 0.0, "timing_start": None}
 
-    # Open the video file, or connect to the webcam. Either way this returns
-    # a "capture" object we read frames from.
-    if video_mode:
-        cap = cv2.VideoCapture(args.video)
-    else:
-        cap = cv2.VideoCapture(CAMERA_INDEX)
+    print("Keys: " + ", ".join(f"{key} {action}" for key, action in keys))
 
-    # VideoCapture does not raise an error if it fails, so we must check.
-    if not cap.isOpened():
-        if video_mode:
-            print(f"Error: could not open the video file: {args.video}")
-        else:
-            print("Error: could not open the webcam.")
-            print("Check that no other app (Zoom, Teams, browser) is using it,")
-            print("and that Windows camera privacy settings allow desktop apps.")
-        sys.exit(1)  # exit code 1 means "something went wrong"
-
-    if video_mode:
-        print(f"Playing {args.video}. Press +/- to change speed, d for debug, "
-              "f for full screen, q to quit.")
-    else:
-        print("Webcam opened. Press c to calibrate, +/- to change speed, "
-              "d for debug, f for full screen, q to quit.")
-
-    # A resizable window (needed for full screen), starting at WINDOW_SIZE.
+    # A resizable window (needed for full screen), starting at WINDOW_SIZE,
+    # on the chosen monitor if there is one. Demo mode starts full screen.
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
     cv2.resizeWindow(WINDOW_NAME, *WINDOW_SIZE)
+    if monitor is not None:
+        cv2.moveWindow(WINDOW_NAME, monitor[0] + 40, monitor[1] + 40)
+    if args.demo:
+        toggle_fullscreen(display, monitor)
+        screen.keep_awake(True)
+
+    # The frame size warning, if any, goes on the status line now (not
+    # before the warm-up, or it would be gone before the window opens).
+    if size_warning:
+        message = size_warning
+        message_time = time.perf_counter()
+    ready_reported = False
 
     # try/finally makes sure the cleanup below runs no matter how the loop ends.
     try:
@@ -629,45 +932,54 @@ def main(argv=None):
                 stats["timing_start"] = loop_start
 
             # Grab one frame (one still picture) from the camera or file.
-            # ret is True if it worked; frame is the image itself.
-            ret, frame = cap.read()
+            # ret is True if it worked; frame is the image itself. The very
+            # first frame was already read by the pre-flight check.
+            if pending_frame is not None:
+                ret, frame = True, pending_frame
+                pending_frame = None
+            else:
+                ret, frame = cap.read()
 
-            # A failed read is the normal end of a video file, but an error
-            # for the webcam (e.g. camera unplugged). Stop either way.
+            # --loop: at the end of the video, start it again. Time keeps
+            # counting up from where this pass ended, so the velocity and
+            # lock timing never see it go backwards, and the lock starts
+            # over, since the scene jumps.
+            if not ret and video_mode and args.loop:
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                loop_offset = frame_t + 1 / (fps if fps > 0 else 30)
+                file_t = None
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                reset_lock()
+                ret, frame = cap.read()
+
+            # A failed read is the normal end of a video file. For the
+            # webcam it's an error (e.g. camera unplugged): keep trying to
+            # reconnect, with the window still up, instead of quitting.
             if not ret:
                 if video_mode:
                     print("End of video.")
-                else:
-                    print("Error: could not read a frame from the webcam.")
-                break
+                    break
+                cap.release()
+                cap, frame = reconnect_camera(display, last_frame, quit_key)
+                if cap is None:
+                    break
+                # The time spent reconnecting isn't a slow frame.
+                last_loop_start = time.perf_counter()
 
             # When this frame was taken. Used for the velocity. For a video
             # file that's the file's own frame time; for the webcam it's now
             # (close enough: right after reading, before the slow YOLO step).
             if video_mode:
-                frame_t = video_time(cap, frame_t)
+                file_t = video_time(cap, file_t)
+                frame_t = loop_offset + file_t
                 stats["video_seconds"] = frame_t
             else:
                 frame_t = time.perf_counter()
             stats["frames"] += 1
             capture_done = time.perf_counter()  # for the debug stage timings
 
-            # The focal length in pixels only fits the resolution it was
-            # calibrated at, so warn once if this frame size is different.
-            if not size_checked:
-                size_checked = True
-                frame_size = (frame.shape[1], frame.shape[0])  # (width, height)
-                if (focal_length is not None and calibration_size is not None
-                        and frame_size != calibration_size):
-                    message = (f"Warning: {frame_size[0]}x{frame_size[1]}, "
-                               f"calibrated at {calibration_size[0]}x"
-                               f"{calibration_size[1]}")
-                    message_time = time.perf_counter()
-                    print(f"Warning: frames are {frame_size[0]}x"
-                          f"{frame_size[1]} but the calibration was made at "
-                          f"{calibration_size[0]}x{calibration_size[1]}. "
-                          "Distances and velocities will be wrong; "
-                          "recalibrate at this resolution.")
+            # Kept to show while the webcam reconnects, if it's lost.
+            last_frame = frame
 
             # Run YOLO in track mode on this frame: it detects, then matches
             # each box to the boxes of earlier frames and gives it an ID.
@@ -935,9 +1247,19 @@ def main(argv=None):
             # 8 bits of the key code so the comparison works on every platform.
             key = cv2.waitKey(1) & 0xFF
 
-            # ord('q') is the key code for the letter q.
+            # Startup time, once the first frame is on screen.
+            if not ready_reported:
+                ready_reported = True
+                report_startup(launch_s, main_start, camera_done, model_done,
+                               warmup_done)
+
+            # ord('q') is the key code for the letter q. In demo mode it has
+            # to be pressed twice.
             if key == ord("q"):
-                break
+                if quit_key.press():
+                    break
+                message = "Press q again to quit"
+                message_time = time.perf_counter()
 
             # c starts calibration, or cancels it if it's already running.
             # Webcam only: a video may have a different resolution, and its
@@ -969,28 +1291,27 @@ def main(argv=None):
                 message = f"Interceptor {speed:.1f} m/s"
                 message_time = time.perf_counter()
 
-            # d shows or hides the debug overlay.
-            if key == ord("d"):
-                display.toggle_debug()
+            # r drops the lock, so the tracker's most confident target is
+            # picked again (for when it's following the wrong object).
+            if key == ord("r"):
+                reset_lock()
+                message = "Lock reset: reacquiring"
+                message_time = time.perf_counter()
 
-            # f switches between full screen and a normal window.
-            if key == ord("f"):
-                if cv2.getWindowProperty(WINDOW_NAME,
-                                         cv2.WND_PROP_FULLSCREEN) == 1:
-                    mode_flag = cv2.WINDOW_NORMAL
-                else:
-                    mode_flag = cv2.WINDOW_FULLSCREEN
-                cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN,
-                                      mode_flag)
+            # d (debug overlay), h (key legend) and f (full screen).
+            handle_view_keys(key, display)
 
             # Stop if the user closed the window with the X button.
-            if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+            if window_closed():
                 break
     finally:
-        # Turn the camera off (or close the file) so other programs can use it.
-        cap.release()
-        # Close every window OpenCV opened.
+        # Turn the camera off (or close the file) so other programs can use
+        # it. cap is None if the webcam was lost and never came back.
+        if cap is not None:
+            cap.release()
+        # Close every window OpenCV opened, and let the laptop sleep again.
         cv2.destroyAllWindows()
+        screen.keep_awake(False)
 
     if video_mode:
         print_video_summary(stats)
@@ -998,4 +1319,15 @@ def main(argv=None):
 
 # Only run main() when this file is run directly (not when it's imported).
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as error:
+        # In demo mode a crash shouldn't fill the screen with a traceback:
+        # save the details to a file and print one line instead.
+        if "--demo" not in sys.argv[1:]:
+            raise
+        with open(ERROR_LOG_PATH, "w") as f:
+            traceback.print_exc(file=f)
+        print(f"Error: {type(error).__name__}: {error} "
+              f"(details in {ERROR_LOG_PATH})")
+        sys.exit(1)
