@@ -8,10 +8,17 @@ lead line to the predicted aim point.
 Usage:
     .venv\\Scripts\\python.exe main.py                     (webcam)
     .venv\\Scripts\\python.exe main.py --video clip.mp4    (recorded file)
+    .venv\\Scripts\\python.exe main.py --demo              (full screen demo)
+Run with --help for all the options; demo.bat and demo_backup.bat start
+the demo with a double-click.
 
 Press c to calibrate (press c again to cancel; webcam only).
-Press + / - to change the interceptor speed.
-Press q (or close the window) to quit.
+Press + / - to change the interceptor speed, r to reset the lock.
+Press d for the debug overlay, h for the key legend, f for full screen.
+Press q (or close the window) to quit; twice in demo mode.
+
+The drawing is in hud.py and the Windows screen helpers in screen.py; this
+file does the detection, tracking and math.
 """
 
 import argparse  # reading command-line options like --video
@@ -19,15 +26,31 @@ import json  # reading and writing calibration.json
 import math  # math functions for the bearing formula and the intercept
 import sys  # used to exit the program with an error code
 import time  # high-precision clock for FPS and webcam timestamps
+import traceback  # saving crash details to a file in demo mode
 from collections import deque  # a list that's quick to trim from the front
 from datetime import datetime  # timestamp saved with the calibration
 from pathlib import Path  # building file paths that work on any OS
 
 import cv2  # OpenCV: camera access, windows, and image drawing
+import numpy as np  # a black frame for the model warm-up
 from ultralytics import YOLO  # Ultralytics: loads and runs YOLO models
 
+import hud  # all the HUD drawing
+import screen  # monitors, full screen and keep-awake on Windows
+
 CAMERA_INDEX = 0  # 0 = the first camera Windows finds (the built-in webcam)
-WINDOW_NAME = "Bottle HUD"  # the title shown on the window
+# Windows' DirectShow opens the webcam in about 1 s; the default backend
+# (Media Foundation) took about 9 s here. The default is still tried if
+# DirectShow can't open the camera.
+CAMERA_BACKEND = cv2.CAP_DSHOW
+WINDOW_NAME = "Interceptor HUD"  # the title shown on the window
+WINDOW_SIZE = (1280, 720)  # starting window size; the HUD itself is bigger
+
+# Demo mode.
+QUIT_CONFIRM_S = 3.0  # in demo mode, q must be pressed twice within this
+RECONNECT_INTERVAL_S = 1.0  # how often to try reopening a lost webcam
+# Crash details in demo mode, next to main.py.
+ERROR_LOG_PATH = Path(__file__).parent / "demo_error.log"
 
 MODEL_PATH = "yolo26n.pt"  # YOLO26 nano; downloaded automatically on first run
 TARGET_CLASS = "bottle"  # the only class we want to show
@@ -37,27 +60,8 @@ IMGSZ = 640  # image size YOLO works at; smaller is faster but sees less detail
 # ByteTrack is lighter than the default BoT-SORT, which spends extra time
 # compensating for a moving camera (ours doesn't move).
 TRACKER_CONFIG = "bytetrack.yaml"
-BOX_COLOR = (0, 255, 0)  # green; OpenCV colors are (blue, green, red)
-TEXT_COLOR = (0, 0, 0)  # black text on the green label background
 
-FONT = cv2.FONT_HERSHEY_SIMPLEX
-LABEL_FONT_SCALE = 0.5  # box labels like "#7 0.85"
-LABEL_FONT_THICKNESS = 1
-
-# Crosshair that marks the origin point (bottom center of the frame).
-CROSSHAIR_SIZE = 20  # length of each arm from the center, in pixels
-CROSSHAIR_COLOR = (0, 0, 255)  # red, so it stands out from the green box
-CROSSHAIR_THICKNESS = 2  # line thickness in pixels
-CROSSHAIR_BOTTOM_MARGIN = 40  # distance from the bottom edge (keep > SIZE)
-
-# Target line from the crosshair to the bottle's center.
-LINE_COLOR = (0, 255, 255)  # yellow
-LINE_THICKNESS = 2  # line thickness in pixels
-TARGET_DOT_RADIUS = 4  # filled dot at the bottle's center, in pixels
-
-# Lead line from the crosshair to the 3D aim point, projected onto the screen.
-LEAD_COLOR = (255, 0, 255)  # magenta
-LEAD_THICKNESS = 2  # line thickness in pixels
+# Lead point: the 3D aim point projected onto the screen.
 # Aim points closer than this (Z, in meters) aren't drawn. Projecting divides
 # by Z, so points at or behind the camera can't be drawn, and the whole
 # bottle only fits in the frame from about 0.18 m away anyway.
@@ -67,19 +71,7 @@ MIN_AIM_Z_M = 0.20
 VELOCITY_WINDOW = 10  # samples per fit; more = steadier but slower to react
 LOST_TIMEOUT_S = 0.5  # missing longer than this (s) resets the history
 
-# HUD panel.
-PANEL_X = 10  # left edge of the panel, in pixels
-PANEL_Y = 10  # top edge of the panel, in pixels
-PANEL_WIDTH = 260  # minimum width; grows only if a line needs more room
-PANEL_PADDING = 8  # space between the panel's edge and the text
-PANEL_VALUE_OFFSET = 70  # where the value column starts, from the text's left
-PANEL_ALPHA = 0.55  # background opacity: 0 = invisible, 1 = solid
-PANEL_BG_COLOR = (0, 0, 0)  # black background
-PANEL_LABEL_COLOR = (180, 180, 180)  # gray labels
-PANEL_TEXT_COLOR = (255, 255, 255)  # white values
-PANEL_STATUS_COLOR = (0, 255, 255)  # yellow status line
-PANEL_FONT_SCALE = 0.5
-PANEL_FONT_THICKNESS = 1
+# Status line.
 STATUS_MESSAGE_SECONDS = 3.0  # how long "Saved"/"Cancelled" messages stay up
 
 # Calibration.
@@ -325,14 +317,15 @@ def measurement_values(target, frame_height, focal_length, speed, smoothed_h):
     # a speed of 0, which blocks the intercept), or is None when there's
     # nothing to explain.
     if focal_length is None:
-        return "--", None, (f"Not calibrated: hold bottle at "
+        return "--", None, (f"Not calibrated: hold {TARGET_CLASS} at "
                             f"{KNOWN_DISTANCE_M:.2f} m, press c")
     if target is None:
         return "--", None, None
 
     x1, y1, x2, y2 = target[:4]
     if touches_edge(y1, y2, frame_height):
-        return "--", None, "Bottle at edge: distance unreliable"
+        return "--", None, (f"{TARGET_CLASS.capitalize()} at edge: "
+                            "distance unreliable")
 
     # Prefer the smoothed h; fall back to this frame's raw h.
     h = smoothed_h if smoothed_h is not None else y2 - y1
@@ -380,20 +373,18 @@ def center_offsets(target, frame):
 
 
 def bearing_values(target, frame, focal_length):
-    # Work out the horizontal and vertical bearing values for the panel.
-    # Returns (horizontal_text, vertical_text). The reason for a "--" (not
-    # calibrated) already comes from measurement_values.
+    # Work out the horizontal and vertical bearing angles for the panel.
+    # Returns (bearing_h, bearing_v) in degrees (right and up positive), or
+    # None. The reason for a None (not calibrated) already comes from
+    # measurement_values.
     if target is None or focal_length is None:
-        return "--", "--"
+        return None
 
     dx, dy = center_offsets(target, frame)
 
     bearing_h = compute_bearing(dx, focal_length)
     bearing_v = compute_bearing(dy, focal_length)
-
-    # :+.1f always shows the sign (+ or -) and one decimal place. "deg"
-    # because OpenCV's fonts can't draw the degree symbol.
-    return f"{bearing_h:+.1f} deg", f"{bearing_v:+.1f} deg"
+    return bearing_h, bearing_v
 
 
 def format_xyz(point):
@@ -439,39 +430,6 @@ def intercept_values(position, velocity_3d, speed):
     return f"{t:.2f} s", format_xyz(aim), aim, None
 
 
-def draw_target_line(frame, origin, target):
-    # Line from the crosshair to the bottle's center, plus a dot at the end.
-    # OpenCV needs whole-number pixel positions, so round the center.
-    bx, by = box_center(target)
-    center = (round(bx), round(by))
-    cv2.line(frame, origin, center, LINE_COLOR, LINE_THICKNESS)
-    # Thickness -1 means a filled circle.
-    cv2.circle(frame, center, TARGET_DOT_RADIUS, LINE_COLOR, -1)
-
-
-def draw_lead_line(frame, origin, lead):
-    # Line from the crosshair to the aim point on screen (lead is its
-    # (x, y) in pixels). Returns True if the point is on screen, False if
-    # it's off screen.
-    height, width = frame.shape[:2]
-    end = (round(lead[0]), round(lead[1]))
-
-    if 0 <= end[0] < width and 0 <= end[1] < height:
-        cv2.line(frame, origin, end, LEAD_COLOR, LEAD_THICKNESS)
-        cv2.circle(frame, end, TARGET_DOT_RADIUS, LEAD_COLOR, -1)
-        return True
-
-    # Off screen: cut the line where it leaves the frame, keeping its
-    # direction. clipLine returns whether any part is inside the rectangle
-    # (x, y, width, height), and the two ends of the part that is.
-    inside, start, edge = cv2.clipLine((0, 0, width, height), origin, end)
-    if inside:
-        cv2.line(frame, start, edge, LEAD_COLOR, LEAD_THICKNESS)
-        # A hollow circle at the edge means "the point is beyond here".
-        cv2.circle(frame, edge, TARGET_DOT_RADIUS + 2, LEAD_COLOR, 2)
-    return False
-
-
 def load_calibration():
     # Returns (focal_length, frame_size). focal_length is None if there's no
     # usable calibration. frame_size is (width, height) of the frames it was
@@ -489,7 +447,7 @@ def load_calibration():
             data = json.load(f)
         focal_length = float(data["focal_length_px"])
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-        print(f"Warning: could not read {CALIBRATION_PATH}; press c to recalibrate.")
+        print(f"WARN: could not read {CALIBRATION_PATH}")
         return None, None
 
     # The frame size is optional, so a missing or odd value just means
@@ -520,147 +478,6 @@ def save_calibration(focal_length, avg_h, frame_size):
         json.dump(data, f, indent=2)
 
 
-def box_label(conf, track_id):
-    # Short label for a box, like "#7 0.85" (track ID and confidence), or
-    # just "0.85" for a box that isn't part of a track yet.
-    if track_id is None:
-        return f"{conf:.2f}"
-    return f"#{track_id} {conf:.2f}"
-
-
-def rects_overlap(a, b):
-    # True if two rectangles (x1, y1, x2, y2) overlap at all.
-    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
-
-
-def draw_label(frame, box, label, avoid):
-    # Draw a box's label on a green background. box is (x1, y1, x2, y2);
-    # avoid is a rectangle (x1, y1, x2, y2) the label must not cover (the
-    # HUD panel).
-
-    # Measure the text, so the background fits it. text_w/text_h are its
-    # width and height in pixels; baseline is the extra space below the line
-    # that letters like "g" hang into.
-    (text_w, text_h), baseline = cv2.getTextSize(label, FONT, LABEL_FONT_SCALE,
-                                                 LABEL_FONT_THICKNESS)
-    label_w = text_w + 8  # 4 px of padding on each side
-    label_h = text_h + baseline + 6
-
-    frame_h, frame_w = frame.shape[:2]
-    x1, y1, x2, y2 = box
-
-    # Line up with the box's left edge, but shift left if needed so the
-    # label never runs off the right edge of the frame.
-    left = max(0, min(x1, frame_w - label_w))
-
-    # Try above the box, then below it, then inside its top, then (for a box
-    # hidden behind the panel) just below the panel. Use the first spot that
-    # fits in the frame and doesn't cover the panel; if none does, fall back
-    # to inside the top of the box.
-    top = max(0, min(y1, frame_h - label_h))
-    for candidate in (y1 - label_h, y2, y1, avoid[3] + 2):
-        rect = (left, candidate, left + label_w, candidate + label_h)
-        if (candidate >= 0 and candidate + label_h <= frame_h
-                and not rects_overlap(rect, avoid)):
-            top = candidate
-            break
-
-    # Filled green rectangle (thickness -1), then the text on top of it.
-    # putText's position is the bottom-left of the text.
-    cv2.rectangle(frame, (left, top), (left + label_w, top + label_h),
-                  BOX_COLOR, -1)
-    cv2.putText(frame, label, (left + 4, top + text_h + 3), FONT,
-                LABEL_FONT_SCALE, TEXT_COLOR, LABEL_FONT_THICKNESS)
-
-
-def panel_text_width(text):
-    # Width of a piece of text in the panel's font, in pixels.
-    (text_w, _), _ = cv2.getTextSize(text, FONT, PANEL_FONT_SCALE,
-                                     PANEL_FONT_THICKNESS)
-    return text_w
-
-
-def draw_panel(frame, rows, status):
-    # Draw the HUD panel: a semi-transparent box with one (label, value) row
-    # per line, plus an optional status line at the bottom. Returns the
-    # panel's rectangle (x1, y1, x2, y2), so box labels can avoid it.
-
-    # Measure the line height from a fixed sample ("(" and "g" are the tallest
-    # and lowest characters), so every line is the same height.
-    (_, text_h), baseline = cv2.getTextSize("(Ag)", FONT, PANEL_FONT_SCALE,
-                                            PANEL_FONT_THICKNESS)
-    line_h = text_h + baseline + 6  # 6 px between lines
-
-    # Width: at least PANEL_WIDTH, wider only if a line needs it.
-    needed = max(PANEL_VALUE_OFFSET + panel_text_width(value)
-                 for label, value in rows)
-    if status:
-        needed = max(needed, panel_text_width(status))
-    width = max(PANEL_WIDTH, needed + 2 * PANEL_PADDING)
-
-    line_count = len(rows) + (1 if status else 0)
-    height = line_count * line_h + 2 * PANEL_PADDING
-
-    # Panel corners, kept inside the frame.
-    frame_h, frame_w = frame.shape[:2]
-    x1, y1 = PANEL_X, PANEL_Y
-    x2 = min(x1 + width, frame_w)
-    y2 = min(y1 + height, frame_h)
-
-    # Semi-transparent background, blended only inside the panel's area.
-    # frame[y1:y2, x1:x2] is that rectangle (rows first, then columns). It's
-    # a view into the frame, so writing into it changes the frame itself.
-    region = frame[y1:y2, x1:x2]
-    overlay = region.copy()
-    overlay[:] = PANEL_BG_COLOR  # fill the copy with the background color
-    # region = overlay * alpha + region * (1 - alpha)
-    cv2.addWeighted(overlay, PANEL_ALPHA, region, 1 - PANEL_ALPHA, 0,
-                    dst=region)
-
-    # Text, fully opaque on top of the background. putText's position is the
-    # bottom-left of the text, hence "+ text_h".
-    text_x = x1 + PANEL_PADDING
-    for i, (label, value) in enumerate(rows):
-        text_y = y1 + PANEL_PADDING + i * line_h + text_h
-        cv2.putText(frame, label, (text_x, text_y), FONT, PANEL_FONT_SCALE,
-                    PANEL_LABEL_COLOR, PANEL_FONT_THICKNESS)
-        cv2.putText(frame, value, (text_x + PANEL_VALUE_OFFSET, text_y), FONT,
-                    PANEL_FONT_SCALE, PANEL_TEXT_COLOR, PANEL_FONT_THICKNESS)
-
-    if status:
-        text_y = y1 + PANEL_PADDING + len(rows) * line_h + text_h
-        cv2.putText(frame, status, (text_x, text_y), FONT, PANEL_FONT_SCALE,
-                    PANEL_STATUS_COLOR, PANEL_FONT_THICKNESS)
-
-    return (x1, y1, x2, y2)
-
-
-def get_origin(frame):
-    # frame.shape is (height, width, colors): rows first, then columns.
-    height, width = frame.shape[:2]
-
-    # Horizontal center. // is whole-number division (pixels are whole numbers).
-    x = width // 2
-
-    # y = 0 is the TOP of the image and grows downward, so subtracting from
-    # the height moves the point up from the bottom edge.
-    y = height - CROSSHAIR_BOTTOM_MARGIN
-
-    return (x, y)
-
-
-def draw_crosshair(frame, origin):
-    x, y = origin
-
-    # Horizontal arm: from left of the center to right of it.
-    cv2.line(frame, (x - CROSSHAIR_SIZE, y), (x + CROSSHAIR_SIZE, y),
-             CROSSHAIR_COLOR, CROSSHAIR_THICKNESS)
-
-    # Vertical arm: from above the center to below it.
-    cv2.line(frame, (x, y - CROSSHAIR_SIZE), (x, y + CROSSHAIR_SIZE),
-             CROSSHAIR_COLOR, CROSSHAIR_THICKNESS)
-
-
 def parse_args(argv):
     # Read the command-line options. argv is the list of options (None means
     # "use the ones the program was started with").
@@ -669,7 +486,224 @@ def parse_args(argv):
     parser.add_argument(
         "--video", metavar="PATH",
         help="run on a recorded video file instead of the webcam")
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--loop", action="store_true",
+        help="with --video: start the video again when it ends")
+    parser.add_argument(
+        "--demo", action="store_true",
+        help="demo mode: full screen, q twice to quit, keep the laptop "
+             "awake, never download the model")
+    parser.add_argument(
+        "--model", metavar="PATH", default=MODEL_PATH,
+        help=f"YOLO model file (default: {MODEL_PATH} in the project folder)")
+    parser.add_argument(
+        "--screen", metavar="N", type=int, nargs="?", const=0,
+        help="put the window on monitor N (1 = the main one); without N, "
+             "list the monitors")
+    args = parser.parse_args(argv)
+    if args.loop and args.video is None:
+        parser.error("--loop only works with --video")
+    return args
+
+
+def model_file(path):
+    # A relative model path is taken from main.py's folder (like
+    # calibration.json), so the model is found no matter which folder the
+    # program is started from.
+    path = Path(path)
+    return path if path.is_absolute() else Path(__file__).parent / path
+
+
+def key_legend(video_mode, demo):
+    # The keys for the on-screen legend, as (key, action) pairs, matching
+    # what the key handling in main() does.
+    keys = [] if video_mode else [("c", "calibrate")]
+    keys += [
+        ("+ / -", "interceptor speed"),
+        ("r", "reset lock"),
+        ("d", "debug overlay"),
+        ("f", "full screen"),
+        ("h", "show/hide keys"),
+        ("q", "quit (press twice)" if demo else "quit"),
+    ]
+    return keys
+
+
+def open_camera():
+    # Open the webcam: DirectShow first (fast on Windows), then the default
+    # backend. Returns the capture, or None if neither works.
+    for backend in (CAMERA_BACKEND, cv2.CAP_ANY):
+        cap = cv2.VideoCapture(CAMERA_INDEX, backend)
+        if cap.isOpened():
+            return cap
+        cap.release()
+    return None
+
+
+def preflight(args, model_path):
+    """Check everything the program needs before the window opens.
+
+    Prints one line per problem ("FAIL: ..." or "WARN: ...") and exits if
+    anything essential is missing, so nothing goes wrong later in front of
+    an audience. Returns (cap, first_frame, focal_length, calibration_size,
+    size_warning): the opened camera or video and its first frame, the
+    calibration (None, None if there isn't one), and a status line message
+    if the frame size doesn't match the calibration (or None).
+    """
+    failures = 0
+    video_mode = args.video is not None
+
+    if not model_path.is_file():
+        if args.demo:
+            print(f"FAIL: model file not found: {model_path} (demo mode never "
+                  "downloads it; copy it into the project folder)")
+            failures += 1
+        else:
+            print(f"WARN: model file not found: {model_path}; Ultralytics "
+                  "will try to download it")
+
+    focal_length, calibration_size = load_calibration()
+    if focal_length is None:
+        print(f"WARN: not calibrated: hold the {TARGET_CLASS} at "
+              f"{KNOWN_DISTANCE_M:.2f} m and press c")
+
+    # The camera or video file, and its first frame (needed to check the
+    # frame size).
+    cap = None
+    frame = None
+    if video_mode:
+        if not Path(args.video).is_file():
+            print(f"FAIL: video file not found: {args.video}")
+            failures += 1
+        else:
+            cap = cv2.VideoCapture(args.video)
+            if not cap.isOpened():
+                print(f"FAIL: could not open the video file: {args.video}")
+                failures += 1
+    else:
+        cap = open_camera()
+        if cap is None:
+            print("FAIL: could not open the webcam (close Zoom, Teams or "
+                  "browser tabs using it, and check Settings > Privacy > "
+                  "Camera); the backup is demo_backup.bat")
+            failures += 1
+
+    if cap is not None and cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            frame = None
+            source = "video file" if video_mode else "webcam"
+            print(f"FAIL: the {source} opened but gives no frames")
+            failures += 1
+
+    # The focal length in pixels only fits the resolution it was
+    # calibrated at.
+    size_warning = None
+    if frame is not None and calibration_size is not None:
+        frame_size = (frame.shape[1], frame.shape[0])  # (width, height)
+        if frame_size != calibration_size:
+            size_warning = (f"Warning: {frame_size[0]}x{frame_size[1]}, "
+                            f"calibrated at {calibration_size[0]}x"
+                            f"{calibration_size[1]}")
+            print(f"WARN: frames are {frame_size[0]}x{frame_size[1]} but the "
+                  f"calibration was made at {calibration_size[0]}x"
+                  f"{calibration_size[1]}; distances will be wrong until you "
+                  "recalibrate")
+
+    if failures:
+        if cap is not None:
+            cap.release()
+        print(f"Pre-flight check failed ({failures} problem"
+              f"{'s' if failures > 1 else ''}); not starting.")
+        sys.exit(1)
+
+    return cap, frame, focal_length, calibration_size, size_warning
+
+
+class QuitKey:
+    """q quits at once, or in demo mode only when pressed twice within
+    QUIT_CONFIRM_S, so one stray key press can't end the demo."""
+
+    def __init__(self, confirm):
+        self.confirm = confirm  # True: needs a second press
+        self.first_press = None  # when q was pressed first (perf_counter)
+
+    def press(self):
+        # Returns True to quit now, False to wait for a second press.
+        now = time.perf_counter()
+        if (not self.confirm or (self.first_press is not None
+                                 and now - self.first_press < QUIT_CONFIRM_S)):
+            return True
+        self.first_press = now
+        return False
+
+
+def toggle_fullscreen(display, monitor=None):
+    # Switch the window between full screen and normal. In full screen the
+    # HUD is drawn at the screen's own size, so it's shown pixel for pixel.
+    # monitor: the screen to fill, or None for the one the window is on.
+    if screen.is_fullscreen(WINDOW_NAME):
+        screen.set_fullscreen(WINDOW_NAME, False)
+        display.set_display_size(hud.DISPLAY_SIZE)
+    else:
+        size = screen.set_fullscreen(WINDOW_NAME, True, monitor)
+        if size is not None:
+            display.set_display_size(size)
+
+
+def handle_view_keys(key, display):
+    # The keys that only change the view, the same in every situation:
+    # d (debug overlay), h (key legend) and f (full screen).
+    if key == ord("d"):
+        display.toggle_debug()
+    if key == ord("h"):
+        display.toggle_legend()
+    if key == ord("f"):
+        toggle_fullscreen(display)
+
+
+def window_closed():
+    # True if the user closed the window with the X button.
+    return cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1
+
+
+def reconnect_camera(display, last_frame, quit_key):
+    """Keep trying to reopen a lost webcam, with the window still working.
+
+    Shows the last frame with a "camera lost" message and tries the camera
+    again every RECONNECT_INTERVAL_S. Returns (cap, frame) once it's back,
+    or (None, None) if the user quits or closes the window meanwhile.
+    """
+    print("Camera lost; trying to reconnect (q to quit).")
+    status = "Camera lost: reconnecting..."
+    next_try = time.perf_counter()
+    while True:
+        if time.perf_counter() >= next_try:
+            cap = open_camera()
+            if cap is not None:
+                ret, frame = cap.read()
+                if ret:
+                    print("Camera reconnected.")
+                    return cap, frame
+                cap.release()
+            next_try = time.perf_counter() + RECONNECT_INTERVAL_S
+
+        image = display.render(
+            last_frame, state=hud.SEARCHING, box=None, track_id=None,
+            conf=None, others=[], lead=None, distance_text="--",
+            bearing=None, intercept_text="--", fps=None, mode="LIVE",
+            status=status, debug_rows=[("camera", "reconnecting")],
+            timings=[])
+        cv2.imshow(WINDOW_NAME, image)
+        key = cv2.waitKey(50) & 0xFF
+
+        if key == ord("q"):
+            if quit_key.press():
+                return None, None
+            status = "Camera lost: press q again to quit"
+        handle_view_keys(key, display)
+        if window_closed():
+            return None, None
 
 
 def video_time(cap, last_t):
@@ -717,17 +751,65 @@ def print_video_summary(stats):
         print(f"  {label:<29}{value}")  # :<29 pads labels to line up
 
 
+def report_startup(launch_s, main_start, camera_done, model_done,
+                   warmup_done):
+    # Print how long it took from launch to the first frame on screen, and
+    # where the time went. launch_s is how long Python and the imports took
+    # before main() started (None if unknown); the rest are perf_counter
+    # times of each step's end.
+    now = time.perf_counter()
+    parts = [("checks + camera", camera_done - main_start),
+             ("model", model_done - camera_done),
+             ("warm-up", warmup_done - model_done),
+             ("window", now - warmup_done)]
+    total = now - main_start
+    if launch_s is not None:
+        parts.insert(0, ("Python + imports", launch_s))
+        total += launch_s
+    details = ", ".join(f"{name} {seconds:.1f} s" for name, seconds in parts)
+    print(f"Ready in {total:.1f} s ({details})")
+
+
 def main(argv=None):
+    # How long Python and the imports took, for the startup report.
+    launch_s = screen.seconds_since_launch()
+    main_start = time.perf_counter()
+
+    # Before any window exists, so full screen uses real pixels.
+    screen.make_dpi_aware()
+
     args = parse_args(argv)
     video_mode = args.video is not None
 
-    # Check the video file before the slow model load, so a typo fails fast.
-    if video_mode and not Path(args.video).is_file():
-        print(f"Error: video file not found: {args.video}")
-        sys.exit(1)
+    # --screen: which monitor the window goes on (None = wherever Windows
+    # puts it). --screen without a number just lists the monitors.
+    monitor = None
+    if args.screen is not None:
+        monitors = screen.list_monitors()
+        if not 1 <= args.screen <= len(monitors):
+            if args.screen != 0:
+                print(f"Error: there is no screen {args.screen}.")
+            for i, (x, y, w, h, primary) in enumerate(monitors, start=1):
+                print(f"Screen {i}: {w}x{h} at ({x}, {y})"
+                      f"{' (main)' if primary else ''}")
+            sys.exit(0 if args.screen == 0 else 1)
+        monitor = monitors[args.screen - 1]
+
+    # Pre-flight checks: model file, calibration, camera or video file.
+    # Also opens the camera (or file) and reads its first frame.
+    model_path = model_file(args.model)
+    cap, first_frame, focal_length, calibration_size, size_warning = (
+        preflight(args, model_path))
+    camera_done = time.perf_counter()
 
     # Load the model once, before the loop (loading is slow).
-    model = YOLO(MODEL_PATH)
+    try:
+        model = YOLO(str(model_path))
+    except Exception as error:  # any problem with the file
+        print(f"FAIL: could not load the model {model_path}: {error}")
+        cap.release()
+        sys.exit(1)
+    model_done = time.perf_counter()
 
     # model.names maps each class ID to its name, e.g. {39: 'bottle', ...}.
     # Look up the ID for our target class instead of hardcoding the number.
@@ -738,17 +820,28 @@ def main(argv=None):
             break
 
     if bottle_id is None:
-        print(f"Error: the model has no class named '{TARGET_CLASS}'.")
+        print(f"FAIL: the model has no class named '{TARGET_CLASS}'.")
+        cap.release()
         sys.exit(1)
 
-    # Load a saved focal length (None if we haven't calibrated yet) and the
-    # frame size it was made with (None if the file doesn't say).
-    focal_length, calibration_size = load_calibration()
-    if focal_length is None:
-        print("Not calibrated yet. Hold the bottle at "
-              f"{KNOWN_DISTANCE_M:.2f} m and press c.")
+    # Warm-up: YOLO's first run takes seconds (PyTorch sets itself up), so
+    # do it now, on a black frame the size of the camera's, instead of
+    # freezing the first live frame. Same settings as the tracking call.
+    model.track(np.zeros_like(first_frame), persist=True,
+                tracker=TRACKER_CONFIG, conf=CONF_THRESHOLD, imgsz=IMGSZ,
+                verbose=False)
+    warmup_done = time.perf_counter()
+
+    height, width = first_frame.shape[:2]
+    if video_mode:
+        source = f"video {args.video} {width}x{height}"
     else:
-        print(f"Loaded focal length: {focal_length:.1f} px")
+        source = f"camera {width}x{height} ({cap.getBackendName()})"
+    if focal_length is None:
+        calibration_text = "not calibrated"
+    else:
+        calibration_text = f"f {focal_length:.1f} px"
+    print(f"OK: {source}, model {model_path.name}, {calibration_text}")
 
     # Calibration state.
     calibrating = False  # True while we're collecting samples
@@ -759,6 +852,12 @@ def main(argv=None):
     speed = DEFAULT_SPEED_MPS  # interceptor speed, changed with + and -
     smoothed_h = None  # running EMA of h; None until there's a bottle to track
 
+    # The HUD, and the lock state it shows (SEARCHING / LOCKED / LOST).
+    keys = key_legend(video_mode, args.demo)
+    display = hud.Hud(TARGET_CLASS, keys=keys)
+    lock = hud.LockIndicator()
+    quit_key = QuitKey(confirm=args.demo)
+
     # Tracking and velocity state.
     locked_id = None  # track ID of the bottle we're following
     history_id = None  # the track ID the history belongs to
@@ -767,41 +866,54 @@ def main(argv=None):
     # the oldest sample automatically, so it always holds the last N.
     history_3d = deque(maxlen=VELOCITY_WINDOW)
 
+    def reset_lock():
+        # Forget the target we're following, so the most confident one is
+        # picked again on the next frame (the r key, and each video loop).
+        # nonlocal: these are main()'s variables, not new ones.
+        nonlocal locked_id, history_id, last_seen, smoothed_h
+        locked_id = None
+        history_id = None
+        last_seen = None
+        smoothed_h = None
+        history_3d.clear()
+        lock.reset()
+
     # FPS state.
     frame_time = None  # smoothed seconds per loop pass; None until measured
     last_loop_start = None  # when the previous loop pass started
     frame_count = 0  # loop passes so far
 
     frame_t = None  # timestamp of the current frame, in seconds
-    size_checked = False  # whether the frame size was compared yet
+    # For a video: the file's own time of the current frame, and how much
+    # to add to it so time keeps counting up when --loop starts it again.
+    file_t = None
+    loop_offset = 0.0
+    pending_frame = first_frame  # read by the pre-flight check, not used yet
+    last_frame = first_frame  # shown while the webcam reconnects
 
     # Counts for the end-of-video summary. timing_start is when the first
     # frame after the warm-up began processing.
     stats = {"frames": 0, "tracked_frames": 0, "track_ids": set(),
              "video_seconds": 0.0, "timing_start": None}
 
-    # Open the video file, or connect to the webcam. Either way this returns
-    # a "capture" object we read frames from.
-    if video_mode:
-        cap = cv2.VideoCapture(args.video)
-    else:
-        cap = cv2.VideoCapture(CAMERA_INDEX)
+    print("Keys: " + ", ".join(f"{key} {action}" for key, action in keys))
 
-    # VideoCapture does not raise an error if it fails, so we must check.
-    if not cap.isOpened():
-        if video_mode:
-            print(f"Error: could not open the video file: {args.video}")
-        else:
-            print("Error: could not open the webcam.")
-            print("Check that no other app (Zoom, Teams, browser) is using it,")
-            print("and that Windows camera privacy settings allow desktop apps.")
-        sys.exit(1)  # exit code 1 means "something went wrong"
+    # A resizable window (needed for full screen), starting at WINDOW_SIZE,
+    # on the chosen monitor if there is one. Demo mode starts full screen.
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+    cv2.resizeWindow(WINDOW_NAME, *WINDOW_SIZE)
+    if monitor is not None:
+        cv2.moveWindow(WINDOW_NAME, monitor[0] + 40, monitor[1] + 40)
+    if args.demo:
+        toggle_fullscreen(display, monitor)
+        screen.keep_awake(True)
 
-    if video_mode:
-        print(f"Playing {args.video}. Press +/- to change speed, q to quit.")
-    else:
-        print("Webcam opened. Press c to calibrate, +/- to change speed, "
-              "q to quit.")
+    # The frame size warning, if any, goes on the status line now (not
+    # before the warm-up, or it would be gone before the window opens).
+    if size_warning:
+        message = size_warning
+        message_time = time.perf_counter()
+    ready_reported = False
 
     # try/finally makes sure the cleanup below runs no matter how the loop ends.
     try:
@@ -820,44 +932,54 @@ def main(argv=None):
                 stats["timing_start"] = loop_start
 
             # Grab one frame (one still picture) from the camera or file.
-            # ret is True if it worked; frame is the image itself.
-            ret, frame = cap.read()
+            # ret is True if it worked; frame is the image itself. The very
+            # first frame was already read by the pre-flight check.
+            if pending_frame is not None:
+                ret, frame = True, pending_frame
+                pending_frame = None
+            else:
+                ret, frame = cap.read()
 
-            # A failed read is the normal end of a video file, but an error
-            # for the webcam (e.g. camera unplugged). Stop either way.
+            # --loop: at the end of the video, start it again. Time keeps
+            # counting up from where this pass ended, so the velocity and
+            # lock timing never see it go backwards, and the lock starts
+            # over, since the scene jumps.
+            if not ret and video_mode and args.loop:
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                loop_offset = frame_t + 1 / (fps if fps > 0 else 30)
+                file_t = None
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                reset_lock()
+                ret, frame = cap.read()
+
+            # A failed read is the normal end of a video file. For the
+            # webcam it's an error (e.g. camera unplugged): keep trying to
+            # reconnect, with the window still up, instead of quitting.
             if not ret:
                 if video_mode:
                     print("End of video.")
-                else:
-                    print("Error: could not read a frame from the webcam.")
-                break
+                    break
+                cap.release()
+                cap, frame = reconnect_camera(display, last_frame, quit_key)
+                if cap is None:
+                    break
+                # The time spent reconnecting isn't a slow frame.
+                last_loop_start = time.perf_counter()
 
             # When this frame was taken. Used for the velocity. For a video
             # file that's the file's own frame time; for the webcam it's now
             # (close enough: right after reading, before the slow YOLO step).
             if video_mode:
-                frame_t = video_time(cap, frame_t)
+                file_t = video_time(cap, file_t)
+                frame_t = loop_offset + file_t
                 stats["video_seconds"] = frame_t
             else:
                 frame_t = time.perf_counter()
             stats["frames"] += 1
+            capture_done = time.perf_counter()  # for the debug stage timings
 
-            # The focal length in pixels only fits the resolution it was
-            # calibrated at, so warn once if this frame size is different.
-            if not size_checked:
-                size_checked = True
-                frame_size = (frame.shape[1], frame.shape[0])  # (width, height)
-                if (focal_length is not None and calibration_size is not None
-                        and frame_size != calibration_size):
-                    message = (f"Warning: {frame_size[0]}x{frame_size[1]}, "
-                               f"calibrated at {calibration_size[0]}x"
-                               f"{calibration_size[1]}")
-                    message_time = time.perf_counter()
-                    print(f"Warning: frames are {frame_size[0]}x"
-                          f"{frame_size[1]} but the calibration was made at "
-                          f"{calibration_size[0]}x{calibration_size[1]}. "
-                          "Distances and velocities will be wrong; "
-                          "recalibrate at this resolution.")
+            # Kept to show while the webcam reconnects, if it's lost.
+            last_frame = frame
 
             # Run YOLO in track mode on this frame: it detects, then matches
             # each box to the boxes of earlier frames and gives it an ID.
@@ -894,10 +1016,6 @@ def main(argv=None):
                 # in pixels of our frame. OpenCV needs whole numbers.
                 x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
                 bottles.append((x1, y1, x2, y2, conf, track_id))
-
-                # The box: top-left corner, bottom-right corner, color,
-                # line thickness.
-                cv2.rectangle(frame, (x1, y1), (x2, y2), BOX_COLOR, 2)
 
                 if track_id is not None:
                     stats["track_ids"].add(track_id)
@@ -940,8 +1058,7 @@ def main(argv=None):
                 target, frame_height, focal_length, speed, smoothed_h)
 
             # Bearing angles for the target, from its raw box center.
-            bearing_h_text, bearing_v_text = bearing_values(
-                target, frame, focal_length)
+            bearing = bearing_values(target, frame, focal_length)
 
             # 3D position: raw box center (like the bearings) and the
             # smoothed distance (like DIST), so all three readouts agree.
@@ -995,15 +1112,16 @@ def main(argv=None):
                     lead = project_to_pixels(aim[0], aim[1], aim[2],
                                              focal_length,
                                              frame_w / 2, frame_h / 2)
+            compute_done = time.perf_counter()  # for the debug stage timings
 
             # While calibrating, collect one h per frame, but only from frames
             # we can trust.
             if calibrating:
                 if len(bottles) == 0:
-                    status = "no bottle"
+                    status = f"no {TARGET_CLASS}"
                 elif len(bottles) > 1:
                     # Can't tell which box is the bottle at the known distance.
-                    status = f"{len(bottles)} bottles"
+                    status = f"{len(bottles)} {TARGET_CLASS}s"
                 else:
                     x1, y1, x2, y2 = bottles[0][:4]
                     if touches_edge(y1, y2, frame_height):
@@ -1028,22 +1146,12 @@ def main(argv=None):
                                f"{CALIBRATION_FRAMES}: {status}")
                 message_time = time.perf_counter()
 
-            origin = get_origin(frame)
-
-            # The target line only needs a bottle, not calibration.
-            if target is not None:
-                draw_target_line(frame, origin, target)
-
-            # The lead line goes on top of the target line, so when the
-            # bottle is still and they overlap, the lead line shows.
-            # Off-screen points keep the clipLine / hollow circle handling.
-            lead_on_screen = True
-            if lead is not None:
-                lead_on_screen = draw_lead_line(frame, origin, lead)
-
-            # Draw the origin crosshair after detection (so YOLO only ever sees
-            # the clean frame) and after the lines (so it sits on top of them).
-            draw_crosshair(frame, origin)
+            # Whether the lead point lands inside the frame (the HUD cuts an
+            # off-screen lead line at the edge).
+            frame_h, frame_w = frame.shape[:2]
+            lead_on_screen = (lead is None
+                              or (0 <= round(lead[0]) < frame_w
+                                  and 0 <= round(lead[1]) < frame_h))
 
             # The status line: a calibration message wins while calibrating
             # or for a few seconds after it was set; then the reason for any
@@ -1065,9 +1173,6 @@ def main(argv=None):
             else:
                 status_line = None
 
-            # Panel values.
-            conf_text = f"{target[4]:.2f}" if target is not None else "--"
-            fps_text = f"{1 / frame_time:.0f}" if frame_time else "--"
             # 3D velocity: right, up, and away from the camera are positive
             # (so a negative Z velocity means the bottle is approaching).
             if velocity_3d is None:
@@ -1077,37 +1182,84 @@ def main(argv=None):
                 vel_text = (f"{signed(vx, 2)} / {signed(vy, 2)} / "
                             f"{signed(vz, 2)} m/s")
 
-            # The panel goes on top of everything except the box labels.
-            panel_rect = draw_panel(frame, [
-                ("DIST", distance_text),
+            # Debug overlay values (hidden unless d is pressed).
+            if bearing is None:
+                bearing_text = "--"
+            else:
+                bearing_text = (f"{signed(bearing[0], 1)} / "
+                                f"{signed(bearing[1], 1)} deg")
+            if focal_length is None:
+                f_text = "--"
+            elif calibration_size is None:
+                f_text = f"{focal_length:.1f} px"
+            else:
+                f_text = (f"{focal_length:.1f} px at {calibration_size[0]}x"
+                          f"{calibration_size[1]}")
+            debug_rows = [
+                ("h raw", f"{target[3] - target[1]} px"
+                          if target is not None else "--"),
+                ("h smooth", f"{smoothed_h:.1f} px"
+                             if smoothed_h is not None else "--"),
                 ("POS", pos_text),
-                ("TIME", time_text),
-                ("AIM", aim_text),
-                ("BRG H", bearing_h_text),
-                ("BRG V", bearing_v_text),
                 ("VEL", vel_text),
-                ("CONF", conf_text),
-                ("SPEED", f"{speed:.1f} m/s  (+/-)"),
-                ("FPS", fps_text),
-            ], status_line)
+                ("AIM", aim_text),
+                ("BRG", bearing_text),
+                ("SPEED", f"{speed:.1f} m/s"),
+                ("f", f_text),
+            ]
 
-            # Box labels last, placed so they don't cover the panel or run
-            # off the frame.
-            for bottle in bottles:
-                draw_label(frame, bottle[:4], box_label(bottle[4], bottle[5]),
-                           panel_rect)
+            if calibrating:
+                mode = f"CALIBRATING {len(samples)}/{CALIBRATION_FRAMES}"
+            else:
+                mode = "VIDEO" if video_mode else "LIVE"
 
-            # Hand the frame to the window. Nothing is drawn until waitKey runs.
-            cv2.imshow(WINDOW_NAME, frame)
+            # Lock state: the HUD only gets plain values, never the bottle
+            # tuples, so a different tracker only changes these calls.
+            if target is None:
+                state, lock_box, lock_id, lock_conf = lock.update(
+                    None, None, None, frame_t)
+            else:
+                state, lock_box, lock_id, lock_conf = lock.update(
+                    target[:4], target[5], target[4], frame_t)
+            others = [(b[:4], b[5], b[4]) for b in bottles if b is not target]
+
+            # The measurements belong to target. While the lock indicator
+            # holds on to a target that just disappeared, they'd describe a
+            # different box (or nothing), so leave them out of the HUD.
+            if target is None or target[5] != lock_id:
+                distance_text, bearing, time_text, lead = "--", None, "--", None
+
+            # Draw the HUD on a scaled-up copy; the frame itself stays clean.
+            image = display.render(
+                frame, state=state, box=lock_box, track_id=lock_id,
+                conf=lock_conf, others=others, lead=lead, distance_text=distance_text,
+                bearing=bearing, intercept_text=time_text,
+                fps=1 / frame_time if frame_time else None, mode=mode,
+                status=status_line, debug_rows=debug_rows,
+                timings=[("capture", capture_done - loop_start),
+                         ("detect + math", compute_done - capture_done)])
+
+            # Hand the image to the window. Nothing is drawn until waitKey runs.
+            cv2.imshow(WINDOW_NAME, image)
 
             # Let the window process its events (actually draw the frame) and
             # wait up to 1 ms for a key press. & 0xFF keeps only the lowest
             # 8 bits of the key code so the comparison works on every platform.
             key = cv2.waitKey(1) & 0xFF
 
-            # ord('q') is the key code for the letter q.
+            # Startup time, once the first frame is on screen.
+            if not ready_reported:
+                ready_reported = True
+                report_startup(launch_s, main_start, camera_done, model_done,
+                               warmup_done)
+
+            # ord('q') is the key code for the letter q. In demo mode it has
+            # to be pressed twice.
             if key == ord("q"):
-                break
+                if quit_key.press():
+                    break
+                message = "Press q again to quit"
+                message_time = time.perf_counter()
 
             # c starts calibration, or cancels it if it's already running.
             # Webcam only: a video may have a different resolution, and its
@@ -1129,19 +1281,37 @@ def main(argv=None):
             # or "_" (Shift is easy to still be holding after typing "+").
             # round() stops tiny decimal errors building up; max() keeps the
             # speed from going below 0.
+            # The speed isn't on the panel, so show it on the status line.
             if key in (ord("+"), ord("=")):
                 speed = round(speed + SPEED_STEP_MPS, 2)
+                message = f"Interceptor {speed:.1f} m/s"
+                message_time = time.perf_counter()
             if key in (ord("-"), ord("_")):
                 speed = max(0.0, round(speed - SPEED_STEP_MPS, 2))
+                message = f"Interceptor {speed:.1f} m/s"
+                message_time = time.perf_counter()
+
+            # r drops the lock, so the tracker's most confident target is
+            # picked again (for when it's following the wrong object).
+            if key == ord("r"):
+                reset_lock()
+                message = "Lock reset: reacquiring"
+                message_time = time.perf_counter()
+
+            # d (debug overlay), h (key legend) and f (full screen).
+            handle_view_keys(key, display)
 
             # Stop if the user closed the window with the X button.
-            if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+            if window_closed():
                 break
     finally:
-        # Turn the camera off (or close the file) so other programs can use it.
-        cap.release()
-        # Close every window OpenCV opened.
+        # Turn the camera off (or close the file) so other programs can use
+        # it. cap is None if the webcam was lost and never came back.
+        if cap is not None:
+            cap.release()
+        # Close every window OpenCV opened, and let the laptop sleep again.
         cv2.destroyAllWindows()
+        screen.keep_awake(False)
 
     if video_mode:
         print_video_summary(stats)
@@ -1149,4 +1319,15 @@ def main(argv=None):
 
 # Only run main() when this file is run directly (not when it's imported).
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as error:
+        # In demo mode a crash shouldn't fill the screen with a traceback:
+        # save the details to a file and print one line instead.
+        if "--demo" not in sys.argv[1:]:
+            raise
+        with open(ERROR_LOG_PATH, "w") as f:
+            traceback.print_exc(file=f)
+        print(f"Error: {type(error).__name__}: {error} "
+              f"(details in {ERROR_LOG_PATH})")
+        sys.exit(1)

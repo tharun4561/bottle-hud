@@ -37,7 +37,28 @@ A recorded video file:
 .venv\Scripts\python.exe main.py --video clip.mp4
 ```
 
-In video mode, timestamps come from the file itself, so velocities are correct even though processing is slower than real time. The program exits by itself at the end of the file and prints a summary (frames processed, frames with a tracked bottle, distinct track IDs, processing speed and the current settings).
+In video mode, timestamps come from the file itself, so velocities are correct even though processing is slower than real time. The program exits by itself at the end of the file and prints a summary (frames processed, frames with a tracked bottle, distinct track IDs, processing speed and the current settings). Add `--loop` to start the video again at the end instead.
+
+Other options: `--model PATH` uses a different YOLO model file (relative paths are taken from the project folder), and `--screen N` puts the window on monitor N (`--screen` alone lists the monitors). Run with `--help` for the full list.
+
+### Demo mode
+
+Double-click **`demo.bat`** (or run it from any terminal; nothing needs activating). It runs `main.py --demo` with the project's own Python. If the webcam fails, double-click **`demo_backup.bat`**: it replays `demo_clip.mp4` from the project folder in a loop (`--demo --video demo_clip.mp4 --loop`). Extra options are passed on, e.g. `demo.bat --screen 2`.
+
+Demo mode:
+
+- Runs pre-flight checks before the window opens, printing one line per problem: `FAIL` (model file missing, webcam or video won't open, no frames) stops the program; `WARN` (not calibrated, resolution doesn't match the calibration) doesn't.
+- Never downloads anything: the model file must already be in the project folder, and the launchers set `YOLO_OFFLINE=1` so Ultralytics skips its internet check.
+- Warms up the model before the window opens and prints the startup time, e.g. `Ready in 10.5 s (Python + imports 4.5 s, checks + camera 1.4 s, model 0.1 s, warm-up 4.2 s, window 0.3 s)`. The first launch after a reboot is slower.
+- Starts full screen with the debug overlay off and the key legend showing for 8 seconds.
+- Needs `q` pressed twice (within 3 seconds) to quit, so one stray key press can't end it.
+- Keeps the laptop from sleeping or turning the screen off.
+- Keeps the window up if the webcam disconnects, showing "Camera lost: reconnecting..." and trying again every second.
+- Saves the details of any crash to `demo_error.log` and prints one line instead of a traceback.
+
+**On the projector:** the simplest setup is Windows' **Duplicate** mode (Win+P), which shows the same picture on the laptop and the projector. With **Extend**, use `demo.bat --screen 2` (check the number with `--screen` first), or drag the window onto the projector and press `f`. Full screen always fills the monitor the window is on, at that monitor's own resolution. Keys only work while the HUD window has focus; click it if they seem dead.
+
+**Before the demo:** plug in the charger and set the power mode to Best performance; turn on Do not disturb; close Zoom, Teams and any browser tab that might use the camera; turn off Windows Studio Effects; bring the bottle and a tape measure (to recalibrate at 1.00 m if needed); copy `demo_clip.mp4` into the project folder; and do one full launch at the venue before going on.
 
 ### Recording test clips
 
@@ -54,7 +75,11 @@ Press `q` to stop. `record.py` records at the webcam's default resolution (the s
 | `c` | Start calibration; press again to cancel (webcam only) |
 | `+` or `=` | Increase the interceptor speed by 0.5 m/s |
 | `-` or `_` | Decrease the interceptor speed by 0.5 m/s (not below 0) |
-| `q` or the window's X button | Quit |
+| `r` | Reset the lock, so the most confident target is picked again |
+| `d` | Show or hide the debug overlay (hidden at start) |
+| `h` | Show or hide the key legend (shown for the first 8 seconds) |
+| `f` | Switch between full screen and a window |
+| `q` or the window's X button | Quit (in demo mode, press `q` twice) |
 
 ## Calibration
 
@@ -70,24 +95,50 @@ Recalibrate after changing the camera, the resolution or the YOLO model. If the 
 
 ## The HUD
 
-### Panel rows
+The HUD is drawn by `hud.py` for an audience. The camera frame is scaled up before anything is drawn, so text stays sharp: in full screen to the screen's own resolution, otherwise to 1920×1080 (`DISPLAY_SIZE`). The panel goes in a strip on the right instead of covering the video (a 4:3 webcam leaves one on a 16:9 screen; on 16:10 the video shrinks slightly to make room).
 
-Positions use camera coordinates: the origin is the camera lens, **X** is positive to the right, **Y** positive up, and **Z** positive straight out of the camera.
+### Lock state
+
+The banner at the top shows the lock state, and the target gets corner brackets in the same color:
+
+| State | Meaning |
+| --- | --- |
+| `SEARCHING` (cyan) | No tracked target. An untracked detection gets thin cyan brackets |
+| `LOCKED BOTTLE #7` (green) | Following track 7. A miss shorter than 0.2 s (`LOST_GRACE_S`) keeps the lock, so one dropped detection doesn't flash the banner |
+| `LOST BOTTLE #7` (red, blinking) | The target disappeared; its last position blinks until 2 s (`LOST_HOLD_S`) after it was last seen |
+
+### Panel rows
 
 | Row | Meaning |
 | --- | --- |
-| `DIST` | Distance to the bottle along the camera's view direction (its depth Z), in meters, from the smoothed box height |
-| `POS` | The bottle's 3D position X / Y / Z, in meters |
-| `TIME` | Time for the interceptor to reach the bottle, in seconds, from the intercept solve |
-| `AIM` | The 3D aim point X / Y / Z, in meters: where the bottle will be when the interceptor arrives |
-| `BRG H` | Horizontal bearing: angle from the camera's view direction, in degrees (right is positive) |
-| `BRG V` | Vertical bearing, in degrees (up is positive) |
-| `VEL` | The bottle's 3D velocity X / Y / Z, in m/s (a negative Z velocity means it's approaching) |
-| `CONF` | YOLO's confidence for the target bottle, from 0 to 1 |
-| `SPEED` | Interceptor speed, in m/s (change it with `+` and `-`) |
+| `DISTANCE` | Distance to the target along the camera's view direction (its depth Z), in meters, from the smoothed box height |
+| `BEARING` | Angle from the camera's view direction, in whole degrees left/right and up/down |
+| `INTERCEPT IN` | Time for the interceptor to reach the target, in seconds, from the intercept solve |
+| `CONFIDENCE` | YOLO's confidence for the target |
 | `FPS` | Frames processed per second |
+| `MODE` | `LIVE` (webcam), `VIDEO` (`--video`) or `CALIBRATING 12/30` |
 
-A value shows `--` when it can't be computed, and the yellow status line under the panel explains why:
+### Debug overlay
+
+Press `d` for the engineering values. Positions use camera coordinates: the origin is the camera lens, **X** is positive to the right, **Y** positive up, and **Z** positive straight out of the camera.
+
+| Row | Meaning |
+| --- | --- |
+| `h raw` / `h smooth` | The target's box height this frame, and its smoothed value, in pixels |
+| `POS` | The target's 3D position X / Y / Z, in meters |
+| `VEL` | Its 3D velocity X / Y / Z, in m/s (a negative Z velocity means it's approaching) |
+| `AIM` | The 3D aim point X / Y / Z, in meters: where the target will be when the interceptor arrives |
+| `BRG` | Horizontal / vertical bearing, in degrees (right and up positive) |
+| `SPEED` | Interceptor speed, in m/s (change it with `+` and `-`; each change is also shown on the status line) |
+| `f` | Calibrated focal length, and the resolution it was made at |
+| `LEAD` | Whether the lead point is on screen |
+| `capture`, `detect + math`, `hud draw` | Smoothed time per stage, in milliseconds |
+
+Every detection also gets a `#7 0.85` label (track ID and confidence).
+
+### Status line
+
+A value shows `--` when it can't be computed, and the yellow status line under the banner explains why:
 
 | Status line | Meaning |
 | --- | --- |
@@ -102,17 +153,22 @@ A value shows `--` when it can't be computed, and the yellow status line under t
 | `Saved: f 615.3 px` / `Calibration cancelled` | Calibration finished or was cancelled (shown for 3 seconds) |
 | `Calibration only works with the webcam` | `c` was pressed in video mode |
 | `Warning: 320x240, calibrated at 640x480` | The frames don't match the calibration's resolution, so distances will be wrong |
+| `Interceptor 5.5 m/s` | The speed was changed with `+` or `-` (shown for 3 seconds) |
+| `Lock reset: reacquiring` | `r` was pressed |
+| `Press q again to quit` | `q` was pressed once in demo mode |
+| `Camera lost: reconnecting...` | The webcam stopped sending frames; the last frame stays up until it's back |
 
 ### On-screen graphics
 
 | Graphic | Meaning |
 | --- | --- |
-| Green box with a `#7 0.85` label | A detected bottle: track ID and confidence (just the confidence if it isn't tracked yet) |
+| Corner brackets with `BOTTLE #7` | The target, in the lock state's color |
+| Thin gray corner brackets | Other detections |
 | Red crosshair at the bottom center | Where both lines start: a screen convention for the launch point (the math puts the interceptor at the camera itself) |
-| Yellow line and dot | Target line to the bottle's current center |
-| Magenta line and dot | Lead line to the projected aim point; a hollow circle at the frame edge means the point is off screen |
+| Yellow line and dot | Target line to the target's current center |
+| Magenta line and reticle | Lead line to the projected aim point; a hollow circle at the frame edge means the point is off screen |
 
-The HUD follows one target bottle: it stays locked on the same track ID while it's visible, and otherwise picks the most confident bottle.
+The HUD follows one target: it stays locked on the same track ID while it's visible, and otherwise picks the most confident detection. The target class is `TARGET_CLASS` in `main.py`; changing it also changes every label and message. Switching to another object also needs its real height in `BOTTLE_HEIGHT_M` and a new calibration.
 
 ## How it works
 
@@ -175,6 +231,8 @@ The main settings are constants at the top of `main.py`:
 | `DEFAULT_SPEED_MPS` | 5.0 | Starting interceptor speed, in m/s |
 | `SPEED_STEP_MPS` | 0.5 | Change per `+` or `-` press, in m/s |
 
+The HUD's settings (display size, text sizes, colors, lock timing, `DEBUG_DEFAULT`) are constants at the top of `hud.py`.
+
 To compare settings fairly, record a few clips with `record.py` and run each setting on the same clips with `--video`; the summary at the end shows how often the bottle was tracked and how many track IDs it got.
 
 ## Known limitations
@@ -190,12 +248,18 @@ To compare settings fairly, record a few clips with `record.py` and run each set
 - **Tracking:** IDs can switch when bottles cross; a bottle needs one detection at 0.25 confidence or above before it's tracked; calibration needs exactly one bottle in view.
 - **Performance:** CPU only, about 11 to 19 FPS on the development laptop. GPU acceleration through PyTorch (CUDA) needs an NVIDIA card.
 - **Video mode:** footage must come from the same camera at the same resolution as the calibration.
+- **Demo mode:** `r` and each `--loop` restart only reset this program's lock; ByteTrack keeps its own tracks, so track IDs keep counting up. A webcam that freezes without reporting an error (rather than disconnecting) isn't detected.
 
 ## Files
 
 | File | Purpose |
 | --- | --- |
-| `main.py` | The HUD program |
+| `main.py` | The program: detection, tracking, measurements and the main loop |
+| `hud.py` | All HUD drawing |
+| `screen.py` | Windows helpers: monitors, full screen, keep-awake, startup time |
+| `demo.bat` / `demo_backup.bat` | Demo launchers (live webcam / looping backup clip) |
+| `demo_clip.mp4` | The backup clip (record it with `record.py`; not in Git) |
+| `demo_error.log` | Crash details from demo mode, if any (not in Git) |
 | `tracker.py` | Detection, track ID lock, calibration, 3D position and velocity (not used by `main.py` yet) |
 | `intercept.py` | Intercept time, aim point and bearing angles; pure math (not used by `main.py` yet) |
 | `bytetrack_low.yaml` | ByteTrack settings with lowered confidence thresholds, used by `tracker.py` |
