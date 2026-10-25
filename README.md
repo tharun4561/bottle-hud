@@ -229,7 +229,7 @@ The main settings are constants at the top of the module that uses them:
 | --- | --- | --- | --- |
 | `MODEL_PATH` | `PavoWeights.pt` | `tracker.py` | The YOLO model (override with `--model`) |
 | `TARGET_CLASS` | `Drone-Interceptor` | `tracker.py` | The model's class to track |
-| `CONF_THRESHOLD` | 0.01 | `tracker.py` | Minimum YOLO confidence. ByteTrack starts new tracks only at 0.03 or above and uses weaker detections (down to 0.01) to keep existing tracks. Those two limits are set in `bytetrack_low.yaml` (the Ultralytics defaults are 0.25 and 0.1) |
+| `CONF_THRESHOLD` | 0.15 | `tracker.py` | Minimum YOLO confidence: weaker detections are dropped before the tracker sees them. The three ByteTrack thresholds in `bytetrack_low.yaml` are set to the same 0.15 (a lower value there would do nothing). Those two limits are set in `bytetrack_low.yaml` (the Ultralytics defaults are 0.25 and 0.1) |
 | `IMGSZ` | 640 | `tracker.py` | Image size YOLO works at: smaller is faster but less accurate for small or far targets (must be a multiple of 32) |
 | `SIZE_AXIS` | `"width"` | `tracker.py` | Which side of the box gives the distance: `"width"` or `"height"` |
 | `TARGET_SIZE_M` | 0.097 | `tracker.py` | Real size of the target along `SIZE_AXIS`, in meters (0.030 for the height) |
@@ -255,7 +255,7 @@ To compare settings fairly, record a few clips with `record.py` and run each set
 - **Straight-line motion only:** the intercept assumes a constant velocity, so a turning target's path isn't predicted. The filter follows turns within a few frames but lags a little, and the velocity shows `--` for a target's first 5 measurements.
 - **Idealized interceptor:** it starts at the camera, reaches full speed instantly, flies straight and has no launch delay. The processing delay (about 60 to 80 ms per frame) isn't compensated, so positions are slightly out of date.
 - **Lead line:** it starts at the crosshair as a screen convention, not along the real flight path. Aim points closer than 0.20 m or behind the camera aren't drawn, and off-screen ones are cut at the frame edge.
-- **Tracking:** IDs can switch when targets cross; a target needs one detection at 0.03 confidence or above before it's tracked (low thresholds also let more false detections through, so raise them in `bytetrack_low.yaml` if other objects get a box); calibration needs exactly one target in view.
+- **Tracking:** IDs can switch when targets cross; a target needs one detection at 0.15 confidence or above before it's tracked (low thresholds also let more false detections through, so raise them in `bytetrack_low.yaml` if other objects get a box); calibration needs exactly one target in view.
 - **Performance:** CPU only, about 11 to 19 FPS on the development laptop. GPU acceleration through PyTorch (CUDA) needs an NVIDIA card.
 - **Video mode:** footage must come from the same camera at the same resolution as the calibration.
 - **Demo mode:** `r` and each `--loop` restart only reset this program's lock; ByteTrack keeps its own tracks, so track IDs keep counting up. A webcam that freezes without reporting an error (rather than disconnecting) isn't detected.

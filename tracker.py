@@ -22,7 +22,7 @@ from ultralytics import YOLO  # Ultralytics: loads and runs YOLO models
 # YOLO nano trained on Roboflow to find the drone (starting from yolo26n.pt).
 MODEL_PATH = str(Path(__file__).parent / "PavoWeights.pt")
 TARGET_CLASS = "Drone-Interceptor"  # the model's only class
-CONF_THRESHOLD = 0.01  # hide detections the model is less sure about than this
+CONF_THRESHOLD = 0.15  # hide detections the model is less sure about than this
 IMGSZ = 640  # image size YOLO works at; smaller is faster but sees less detail
 # Tracker that gives each bottle an ID that stays the same across frames.
 # ByteTrack is lighter than the default BoT-SORT, which spends extra time
