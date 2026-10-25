@@ -1,12 +1,12 @@
 # ByteTrack settings for main.py: the Ultralytics defaults, with the three
-# confidence thresholds lowered so weakly detected bottles are still tracked.
+# confidence thresholds lowered so weakly detected targets are still tracked.
 # The defaults are 0.25 / 0.1 / 0.25. Raise these if other objects start
-# showing up as bottles.
+# showing up as targets.
 
 tracker_type: bytetrack # (str) Tracker backend: bytetrack
-track_high_thresh: 0.1 # (float) First-stage match threshold; raise for cleaner tracks, lower to keep more
-track_low_thresh: 0.05 # (float) Second-stage threshold for low-score matches; balances recovery vs drift
-new_track_thresh: 0.1 # (float) Start a new track if no match >= this; higher reduces false tracks
+track_high_thresh: 0.03 # (float) First-stage match threshold; raise for cleaner tracks, lower to keep more
+track_low_thresh: 0.01 # (float) Second-stage threshold for low-score matches; balances recovery vs drift
+new_track_thresh: 0.03 # (float) Start a new track if no match >= this; higher reduces false tracks
 track_buffer: 30 # (int) Frames to keep lost tracks alive; higher handles occlusion, increases ID switches risk
 match_thresh: 0.8 # (float) Association similarity threshold (IoU/cost); tune with detector quality
 fuse_score: True # (bool) Fuse detection score with motion/IoU for matching; stabilizes weak detections

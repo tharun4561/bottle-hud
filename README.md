@@ -1,8 +1,8 @@
-# Bottle Interceptor HUD
+# Interceptor HUD
 
-Real-time water bottle detection and interception targeting from a single webcam.
+Real-time drone detection and interception targeting from a single webcam.
 
-The program detects and tracks a bottle with YOLO26 (Ultralytics) and ByteTrack, estimates its 3D position and velocity in meters using a calibrated focal length, solves for the time an interceptor launched from the camera would need to reach it, and draws a targeting HUD with a lead line to the predicted aim point. It runs on the CPU with OpenCV and can also process recorded video files.
+The program detects and tracks the target (a small drone) with a YOLO26 nano model trained on Roboflow (Ultralytics) and ByteTrack, estimates its 3D position and velocity in meters using a calibrated focal length, solves for the time an interceptor launched from the camera would need to reach it, and draws a targeting HUD with a lead line to the predicted aim point. It runs on the CPU with OpenCV and can also process recorded video files.
 
 ## Requirements
 
@@ -21,7 +21,7 @@ py -3.14 -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-The YOLO26 nano model (`yolo26n.pt`, about 5 MB) downloads automatically the first time the program runs.
+The trained model, `PavoWeights.pt` (about 5 MB, one class: `Drone-Interceptor`), is not in Git (`*.pt` files are ignored): copy it into the project folder before the first run. The program never downloads it.
 
 ## Running
 
@@ -37,7 +37,7 @@ A recorded video file:
 .venv\Scripts\python.exe main.py --video clip.mp4
 ```
 
-In video mode, timestamps come from the file itself, so velocities are correct even though processing is slower than real time. The program exits by itself at the end of the file and prints a summary (frames processed, frames with a tracked bottle, distinct track IDs, processing speed and the current settings). Add `--loop` to start the video again at the end instead.
+In video mode, timestamps come from the file itself, so velocities are correct even though processing is slower than real time. The program exits by itself at the end of the file and prints a summary (frames processed, frames with a tracked target, distinct track IDs, processing speed and the current settings). Add `--loop` to start the video again at the end instead.
 
 Other options: `--model PATH` uses a different YOLO model file (relative paths are taken from the project folder), and `--screen N` puts the window on monitor N (`--screen` alone lists the monitors). Run with `--help` for the full list.
 
@@ -58,7 +58,7 @@ Demo mode:
 
 **On the projector:** the simplest setup is Windows' **Duplicate** mode (Win+P), which shows the same picture on the laptop and the projector. With **Extend**, use `demo.bat --screen 2` (check the number with `--screen` first), or drag the window onto the projector and press `f`. Full screen always fills the monitor the window is on, at that monitor's own resolution. Keys only work while the HUD window has focus; click it if they seem dead.
 
-**Before the demo:** plug in the charger and set the power mode to Best performance; turn on Do not disturb; close Zoom, Teams and any browser tab that might use the camera; turn off Windows Studio Effects; bring the bottle and a tape measure (to recalibrate at 1.00 m if needed); copy `demo_clip.mp4` into the project folder; and do one full launch at the venue before going on.
+**Before the demo:** plug in the charger and set the power mode to Best performance; turn on Do not disturb; close Zoom, Teams and any browser tab that might use the camera; turn off Windows Studio Effects; bring the drone and a tape measure (to recalibrate at 1.00 m if needed); copy `demo_clip.mp4` into the project folder; and do one full launch at the venue before going on.
 
 ### Recording test clips
 
@@ -83,13 +83,15 @@ Press `q` to stop. `record.py` records at the webcam's default resolution (the s
 
 ## Calibration
 
-Distances come from the bottle's height in the image, which needs the camera's focal length in pixels. It's measured once per camera and resolution:
+Distances come from how wide the drone's box is in the image (`SIZE_AXIS` in `tracker.py`), which needs the camera's focal length in pixels. It's measured once per camera and resolution:
 
-1. Stand the bottle upright exactly 1.00 m from the webcam lens, fully in view, with nothing else in the frame that looks like a bottle.
-2. Press `c`. The program averages the box height over 30 frames (skipping frames with no bottle, two bottles, or a box touching the frame edge) and computes `f = h × D / H`.
+1. Hold the drone exactly 1.00 m from the webcam lens, facing the camera, fully in view, with nothing else in the frame that looks like it.
+2. Press `c`. The program averages the box width over 30 frames (skipping frames with no target, two targets, or a box touching the left or right edge) and computes `f = w × D / S`, where `S = 0.097 m` is the drone's real width.
 3. The result is saved to `calibration.json` (ignored by Git, since it belongs to one camera) and loaded automatically from then on.
 
-This project's calibration: bottle height **H = 0.142 m**, distance **D = 1.00 m**, average box height **h ≈ 87.4 px**, giving a focal length of **f = 615.3 px** at **640×480**.
+Calibrate again with the drone before trusting any distance: a `calibration.json` made earlier with the bottle used a different object size.
+
+The drone is 97 × 97 mm and about 30 mm tall. The width is used because it spans about three times as many pixels as the height, so a pixel of noise matters less. A square body seen at an angle looks up to 1.4 times wider, so keep it facing the camera when calibrating. To measure the height instead, set `SIZE_AXIS = "height"` and `TARGET_SIZE_M = 0.030` in `tracker.py`.
 
 Recalibrate after changing the camera, the resolution or the YOLO model. If the camera has an automatic framing or zoom feature (such as Windows Studio Effects), turn it off. The program warns if the frames don't match the resolution the calibration was made at.
 
@@ -104,8 +106,8 @@ The banner at the top shows the lock state, and the target gets corner brackets 
 | State | Meaning |
 | --- | --- |
 | `SEARCHING` (cyan) | No tracked target. An untracked detection gets thin cyan brackets |
-| `LOCKED BOTTLE #7` (green) | Following track 7. A miss shorter than 0.2 s (`LOST_GRACE_S`) keeps the lock, so one dropped detection doesn't flash the banner |
-| `LOST BOTTLE #7` (red, blinking) | The target disappeared; its last position blinks until 2 s (`LOST_HOLD_S`) after it was last seen |
+| `LOCKED DRONE-INTERCEPTOR #7` (green) | Following track 7. A miss shorter than 0.2 s (`LOST_GRACE_S`) keeps the lock, so one dropped detection doesn't flash the banner |
+| `LOST DRONE-INTERCEPTOR #7` (red, blinking) | The target disappeared; its last position blinks until 2 s (`LOST_HOLD_S`) after it was last seen |
 
 ### Panel rows
 
@@ -142,14 +144,14 @@ A value shows `--` when it can't be computed, and the yellow status line under t
 
 | Status line | Meaning |
 | --- | --- |
-| `Not calibrated: hold bottle at 1.00 m, press c` | No focal length yet |
-| `Bottle at edge: distance unreliable` | The box touches the top or bottom edge, so it may be cut off |
+| `Not calibrated: hold Drone-Interceptor at 1.00 m, press c` | No focal length yet |
+| `Drone-interceptor at edge: distance unreliable` | The box touches the left or right edge, so it may be cut off |
 | `Speed is 0: press + to speed up` | An interceptor speed of 0 never arrives |
-| `Measuring velocity...` | Collecting the first 10 positions of a newly tracked bottle |
-| `No intercept: target too fast` | The bottle is at least as fast as the interceptor and moving away |
+| `Measuring velocity...` | Waiting for the first 5 measurements of a newly tracked target |
+| `No intercept: target too fast` | The target is at least as fast as the interceptor and moving away |
 | `Aim point at/behind camera` | The aim point is closer than 0.20 m, so it can't be drawn |
 | `Lead point off screen` | The aim point is outside the frame |
-| `Calibrating 12/30: h 87` | Calibration progress (also `no bottle`, `2 bottles` or `at edge` when a frame is skipped) |
+| `Calibrating 12/30: size 87` | Calibration progress, with the box width in pixels (also `no Drone-Interceptor`, `2 Drone-Interceptors` or `at edge` when a frame is skipped) |
 | `Saved: f 615.3 px` / `Calibration cancelled` | Calibration finished or was cancelled (shown for 3 seconds) |
 | `Calibration only works with the webcam` | `c` was pressed in video mode |
 | `Warning: 320x240, calibrated at 640x480` | The frames don't match the calibration's resolution, so distances will be wrong |
@@ -162,28 +164,28 @@ A value shows `--` when it can't be computed, and the yellow status line under t
 
 | Graphic | Meaning |
 | --- | --- |
-| Corner brackets with `BOTTLE #7` | The target, in the lock state's color |
+| Corner brackets with `DRONE-INTERCEPTOR #7` | The target, in the lock state's color |
 | Thin gray corner brackets | Other detections |
 | Red crosshair at the bottom center | Where both lines start: a screen convention for the launch point (the math puts the interceptor at the camera itself) |
 | Yellow line and dot | Target line to the target's current center |
 | Magenta line and reticle | Lead line to the projected aim point; a hollow circle at the frame edge means the point is off screen |
 
-The HUD follows one target: it stays locked on the same track ID while it's visible, and otherwise picks the most confident detection. The target class is `TARGET_CLASS` in `main.py`; changing it also changes every label and message. Switching to another object also needs its real height in `BOTTLE_HEIGHT_M` and a new calibration.
+The HUD follows one target: it stays locked on the same track ID while it's visible, and otherwise picks the most confident detection. The target class is `TARGET_CLASS` in `tracker.py`; changing it also changes every label and message. Switching to another object also needs its real size in `TARGET_SIZE_M` (and `SIZE_AXIS`) and a new calibration.
 
 ## How it works
 
-Each frame, the program detects and tracks bottles, then runs these steps for the target bottle. Pixel offsets `dx` and `dy` are measured from the image center (right and up positive), `h` is the box height in pixels and `f` is the focal length in pixels.
+`tracker.py` detects and tracks the target and measures its 3D position and velocity, `intercept.py` solves the intercept, and `main.py` connects them to the camera, the keys and the HUD. Each frame runs these steps for the target. Pixel offsets `dx` and `dy` are measured from the image center (right and up positive), `w` is the box width in pixels (the side set by `SIZE_AXIS`), `S` is the target's real size along that side and `f` is the focal length in pixels.
 
-**Calibration** (similar triangles: the image is `h` pixels tall at distance `f`, the bottle is `H` meters tall at distance `D`):
+**Calibration** (similar triangles: the image is `w` pixels wide at distance `f`, the target is `S` meters wide at distance `D`):
 
 ```text
-f = h × D / H
+f = w × D / S
 ```
 
-**Distance** (depth), using the box height smoothed with an exponential moving average (`h_smooth = 0.3 × h + 0.7 × h_smooth`):
+**Distance** (depth), using the box width smoothed with an exponential moving average (`w_smooth = 0.3 × w + 0.7 × w_smooth`):
 
 ```text
-Z = f × H / h
+Z = f × S / w
 ```
 
 **3D position and bearing:**
@@ -194,20 +196,23 @@ Y = dy × Z / f
 bearing = atan(offset / f)        (once for dx, once for dy)
 ```
 
-**Velocity:** a least-squares straight-line fit through the last 10 positions, separately for X, Y and Z. The slope is the velocity. Timestamps are shifted to start at 0 for numerical precision, and they come from the clock (webcam) or from the file (video).
+**Position and velocity:** a Kalman filter, run separately for X, Y and Z. Each axis tracks a position and a velocity and assumes the target moves at a roughly constant velocity. Each frame it predicts forward by the real time since the last measurement, then blends in the new raw position, trusting it less when the target is far (the depth error grows with the square of the distance: `σ_Z = Z² × σ_w / (f × S)`). The velocity is shown after 5 measurements. Timestamps come from the clock (webcam) or from the file (video).
 
 ```text
-v = Σ (t − t̄)(p − p̄) / Σ (t − t̄)²
+predict:  p = p + v·dt          (the uncertainty grows by the allowed acceleration)
+update:   p = p + K·(measured − p),  v = v + K_v·(measured − p)
 ```
 
-**Intercept:** the interceptor starts at the camera and flies in a straight line at speed `s`. It meets the bottle (position `P`, velocity `V`) when its flight distance equals the bottle's distance at that time:
+The filter starts over when the target's track ID changes or the target is missing for more than 0.5 s.
+
+**Intercept:** the interceptor starts at the camera and flies in a straight line at speed `s`. It meets the target (position `P`, velocity `V`) when its flight distance equals the target's distance at that time:
 
 ```text
 |P + V·t| = s·t
 (V·V − s²) t² + 2 (P·V) t + P·P = 0
 ```
 
-The smallest positive root is the intercept time, and the aim point is `P + V·t`. When the interceptor is faster than the bottle there's always exactly one positive root. A still bottle gives `t = |P| / s`.
+The smallest positive root is the intercept time, and the aim point is `P + V·t`. When the interceptor is faster than the target there's always exactly one positive root. A still target gives `t = |P| / s`.
 
 **Projection** of the aim point back onto the screen (`cx`, `cy` is the image center; pixel y grows downward, so Y is flipped):
 
@@ -218,34 +223,39 @@ pixel_y = cy − f × Y / Z
 
 ## Settings
 
-The main settings are constants at the top of `main.py`:
+The main settings are constants at the top of the module that uses them:
 
-| Constant | Value | Meaning |
-| --- | --- | --- |
-| `CONF_THRESHOLD` | 0.1 | Minimum YOLO confidence. ByteTrack starts new tracks only at 0.25 or above and uses weaker detections (down to 0.1) to keep existing tracks |
-| `IMGSZ` | 640 | Image size YOLO works at: smaller is faster but less accurate for small or far bottles (must be a multiple of 32) |
-| `BOTTLE_HEIGHT_M` | 0.142 | Real height of the bottle, in meters |
-| `KNOWN_DISTANCE_M` | 1.00 | Calibration distance, in meters |
-| `VELOCITY_WINDOW` | 10 | Positions per velocity fit: more is steadier but slower to react |
-| `MIN_AIM_Z_M` | 0.20 | Aim points closer than this aren't drawn |
-| `DEFAULT_SPEED_MPS` | 5.0 | Starting interceptor speed, in m/s |
-| `SPEED_STEP_MPS` | 0.5 | Change per `+` or `-` press, in m/s |
+| Constant | Value | File | Meaning |
+| --- | --- | --- | --- |
+| `MODEL_PATH` | `PavoWeights.pt` | `tracker.py` | The YOLO model (override with `--model`) |
+| `TARGET_CLASS` | `Drone-Interceptor` | `tracker.py` | The model's class to track |
+| `CONF_THRESHOLD` | 0.01 | `tracker.py` | Minimum YOLO confidence. ByteTrack starts new tracks only at 0.03 or above and uses weaker detections (down to 0.01) to keep existing tracks. Those two limits are set in `bytetrack_low.yaml` (the Ultralytics defaults are 0.25 and 0.1) |
+| `IMGSZ` | 640 | `tracker.py` | Image size YOLO works at: smaller is faster but less accurate for small or far targets (must be a multiple of 32) |
+| `SIZE_AXIS` | `"width"` | `tracker.py` | Which side of the box gives the distance: `"width"` or `"height"` |
+| `TARGET_SIZE_M` | 0.097 | `tracker.py` | Real size of the target along `SIZE_AXIS`, in meters (0.030 for the height) |
+| `KNOWN_DISTANCE_M` | 1.00 | `tracker.py` | Calibration distance, in meters |
+| `ACCEL_SIGMA_MPS2` | 1.0 | `tracker.py` | Kalman process noise: how much the velocity may change per second (bigger follows turns faster but is noisier) |
+| `CENTER_SIGMA_PX`, `SIZE_SIGMA_PX` | 1.0, 1.5 | `tracker.py` | How much the box center and width jitter, in pixels (bigger trusts each measurement less: smoother but slower) |
+| `WARMUP_UPDATES` | 5 | `tracker.py` | Measurements before the velocity is shown |
+| `MIN_AIM_Z_M` | 0.20 | `main.py` | Aim points closer than this aren't drawn |
+| `DEFAULT_SPEED_MPS` | 5.0 | `intercept.py` | Starting interceptor speed, in m/s |
+| `SPEED_STEP_MPS` | 0.5 | `intercept.py` | Change per `+` or `-` press, in m/s |
 
 The HUD's settings (display size, text sizes, colors, lock timing, `DEBUG_DEFAULT`) are constants at the top of `hud.py`.
 
-To compare settings fairly, record a few clips with `record.py` and run each setting on the same clips with `--video`; the summary at the end shows how often the bottle was tracked and how many track IDs it got.
+To compare settings fairly, record a few clips with `record.py` and run each setting on the same clips with `--video`; the summary at the end shows how often the target was tracked and how many track IDs it got.
 
 ## Known limitations
 
-- **Bottle size:** distance assumes a 0.142 m bottle. A different bottle gives a proportionally wrong distance, and YOLO's "bottle" class accepts any bottle.
-- **Box height:** tilt, rotation, a hand covering part of the bottle, motion blur and how tightly YOLO fits the box all change `h`, and therefore the distance. Boxes touching the top or bottom edge are excluded.
+- **Target size:** distance assumes the drone's real width is 0.097 m. A different drone gives a proportionally wrong distance.
+- **Box width:** turning (a square body looks up to 1.4 times wider at an angle), a hand covering part of the drone, motion blur and how tightly YOLO fits the box all change `w`, and therefore the distance. Boxes touching the left or right edge are excluded. At 2 m the drone is only about 29 px wide, so one pixel is about 3.4% of the distance.
 - **Range:** depth error grows with the square of the distance (about ±2 cm at 1 m, about ±9 cm at 2 m). The practical range is about 0.2 to 3 m.
 - **Simple camera model:** no lens distortion correction, and the image center is assumed to be the optical center. The calibration is only valid for this camera at 640×480, with automatic framing turned off.
-- **Fixed camera:** if the camera moves, the whole scene appears to move, and that shows up as bottle velocity.
-- **Straight-line motion only:** no acceleration or gravity, so a thrown bottle's arc isn't predicted. The velocity reflects the last 10 samples (about 0.5 to 0.9 s), so it lags behind changes, and it shows `--` for a bottle's first 10 samples.
+- **Fixed camera:** if the camera moves, the whole scene appears to move, and that shows up as target velocity.
+- **Straight-line motion only:** the intercept assumes a constant velocity, so a turning target's path isn't predicted. The filter follows turns within a few frames but lags a little, and the velocity shows `--` for a target's first 5 measurements.
 - **Idealized interceptor:** it starts at the camera, reaches full speed instantly, flies straight and has no launch delay. The processing delay (about 60 to 80 ms per frame) isn't compensated, so positions are slightly out of date.
 - **Lead line:** it starts at the crosshair as a screen convention, not along the real flight path. Aim points closer than 0.20 m or behind the camera aren't drawn, and off-screen ones are cut at the frame edge.
-- **Tracking:** IDs can switch when bottles cross; a bottle needs one detection at 0.25 confidence or above before it's tracked; calibration needs exactly one bottle in view.
+- **Tracking:** IDs can switch when targets cross; a target needs one detection at 0.03 confidence or above before it's tracked (low thresholds also let more false detections through, so raise them in `bytetrack_low.yaml` if other objects get a box); calibration needs exactly one target in view.
 - **Performance:** CPU only, about 11 to 19 FPS on the development laptop. GPU acceleration through PyTorch (CUDA) needs an NVIDIA card.
 - **Video mode:** footage must come from the same camera at the same resolution as the calibration.
 - **Demo mode:** `r` and each `--loop` restart only reset this program's lock; ByteTrack keeps its own tracks, so track IDs keep counting up. A webcam that freezes without reporting an error (rather than disconnecting) isn't detected.
@@ -254,17 +264,17 @@ To compare settings fairly, record a few clips with `record.py` and run each set
 
 | File | Purpose |
 | --- | --- |
-| `main.py` | The program: detection, tracking, measurements and the main loop |
+| `main.py` | The program: camera or video input, the main loop, the keys and demo mode |
 | `hud.py` | All HUD drawing |
 | `screen.py` | Windows helpers: monitors, full screen, keep-awake, startup time |
 | `demo.bat` / `demo_backup.bat` | Demo launchers (live webcam / looping backup clip) |
 | `demo_clip.mp4` | The backup clip (record it with `record.py`; not in Git) |
 | `demo_error.log` | Crash details from demo mode, if any (not in Git) |
-| `tracker.py` | Detection, track ID lock, calibration, 3D position and velocity (not used by `main.py` yet) |
-| `intercept.py` | Intercept time, aim point and bearing angles; pure math (not used by `main.py` yet) |
+| `tracker.py` | Detection, track ID lock, calibration, Kalman-filtered 3D position and velocity |
+| `intercept.py` | Intercept time, aim point and bearing angles; pure math, no camera or drawing |
 | `bytetrack_low.yaml` | ByteTrack settings with lowered confidence thresholds, used by `tracker.py` |
 | `record.py` | Records test clips from the webcam |
 | `requirements.txt` | Python packages with tested versions |
 | `NOTES.md` | Development notes and answers for each milestone |
 | `calibration.json` | Saved calibration (created by pressing `c`; not in Git) |
-| `yolo26n.pt` | YOLO26 nano model (downloaded on first run; not in Git) |
+| `PavoWeights.pt` | The trained drone model (copy it in; not in Git) |

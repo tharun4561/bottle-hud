@@ -12,17 +12,17 @@ camera. Everything is in meters unless a name says px.
 """
 
 import json  # reading and writing calibration.json
-import sys  # used to exit the program with an error code
 from datetime import datetime  # timestamp saved with the calibration
 from pathlib import Path  # building file paths that work on any OS
 from typing import NamedTuple, Optional
 
+import numpy as np  # a black frame for the warm-up
 from ultralytics import YOLO  # Ultralytics: loads and runs YOLO models
 
 # YOLO nano trained on Roboflow to find the drone (starting from yolo26n.pt).
 MODEL_PATH = str(Path(__file__).parent / "PavoWeights.pt")
 TARGET_CLASS = "Drone-Interceptor"  # the model's only class
-CONF_THRESHOLD = 0.05  # hide detections the model is less sure about than this
+CONF_THRESHOLD = 0.01  # hide detections the model is less sure about than this
 IMGSZ = 640  # image size YOLO works at; smaller is faster but sees less detail
 # Tracker that gives each bottle an ID that stays the same across frames.
 # ByteTrack is lighter than the default BoT-SORT, which spends extra time
@@ -348,13 +348,14 @@ def measure_distance(target, frame_width, frame_height, focal_length,
     # explains a missing distance for the status line, or is None when
     # there's nothing to explain.
     if focal_length is None:
-        return None, (f"Not calibrated: hold target at "
+        return None, (f"Not calibrated: hold {TARGET_CLASS} at "
                       f"{KNOWN_DISTANCE_M:.2f} m, press c")
     if target is None:
         return None, None
 
     if touches_edge(target, frame_width, frame_height):
-        return None, "Target at edge: distance unreliable"
+        return None, (f"{TARGET_CLASS.capitalize()} at edge: "
+                      "distance unreliable")
 
     # Prefer the smoothed size; fall back to this frame's raw size.
     size = smoothed_size if smoothed_size is not None else box_size(target)
@@ -418,9 +419,18 @@ def save_calibration(focal_length, avg_size, frame_size):
 class Tracker:
     """Detects and tracks the target, and measures it in 3D."""
 
-    def __init__(self):
+    def __init__(self, model_path=MODEL_PATH, calibration=None):
+        """Load the model and the calibration.
+
+        model_path: the YOLO model file
+        calibration: (focal_length, frame_size) if the caller already loaded
+            it with load_calibration(), or None to load it here
+
+        Raises ValueError if the model has no TARGET_CLASS class. A model
+        file that can't be loaded raises whatever YOLO raises.
+        """
         # Load the model once (loading is slow).
-        self.model = YOLO(MODEL_PATH)
+        self.model = YOLO(str(model_path))
 
         # model.names maps each class ID to its name, e.g. {0: 'Drone-Interceptor'}.
         # Look up the ID for our target class instead of hardcoding the number.
@@ -431,17 +441,13 @@ class Tracker:
                 break
 
         if self.bottle_id is None:
-            print(f"Error: the model has no class named '{TARGET_CLASS}'.")
-            sys.exit(1)
+            raise ValueError(f"the model has no class named '{TARGET_CLASS}'")
 
-        # Load a saved focal length (None if we haven't calibrated yet) and
-        # the frame size it was made with (None if the file doesn't say).
-        self.focal_length, self.calibration_size = load_calibration()
-        if self.focal_length is None:
-            print("Not calibrated yet. Hold the target at "
-                  f"{KNOWN_DISTANCE_M:.2f} m and press c.")
-        else:
-            print(f"Loaded focal length: {self.focal_length:.1f} px")
+        # The saved focal length (None if we haven't calibrated yet) and the
+        # frame size it was made with (None if the file doesn't say).
+        if calibration is None:
+            calibration = load_calibration()
+        self.focal_length, self.calibration_size = calibration
 
         # Calibration state.
         self.calibrating = False  # True while we're collecting samples
@@ -454,6 +460,28 @@ class Tracker:
         self.last_seen = None  # when the target was last seen (seconds)
         # Filters the target's raw 3D positions into a position and velocity.
         self.filter = BottleFilter()
+
+    def warm_up(self, frame):
+        """Run the model once on a black frame the size of frame.
+
+        YOLO's first run takes seconds (PyTorch sets itself up), so do it
+        before the loop instead of freezing the first live frame. It uses the
+        same settings as update(), and doesn't change what the tracker knows
+        about the target.
+        """
+        self.model.track(np.zeros_like(frame), persist=True,
+                         tracker=TRACKER_CONFIG, conf=CONF_THRESHOLD,
+                         imgsz=IMGSZ, verbose=False)
+
+    def reset(self):
+        """Forget the target being followed, so the most confident one is
+        picked again on the next frame (for when it's following the wrong
+        object, or the video starts over)."""
+        self.locked_id = None
+        self.history_id = None
+        self.last_seen = None
+        self.smoothed_size = None
+        self.filter.reset()
 
     def toggle_calibration(self):
         """Start calibration, or cancel it if it's already running.
@@ -595,10 +623,10 @@ class Tracker:
             return None
 
         if len(bottles) == 0:
-            status = "no target"
+            status = f"no {TARGET_CLASS}"
         elif len(bottles) > 1:
             # Can't tell which box is the target at the known distance.
-            status = f"{len(bottles)} targets"
+            status = f"{len(bottles)} {TARGET_CLASS}s"
         else:
             frame_height, frame_width = frame.shape[:2]
             if touches_edge(bottles[0], frame_width, frame_height):
