@@ -21,7 +21,7 @@ py -3.14 -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-The trained model, `PavoWeights.pt` (about 5 MB, one class: `Drone-Interceptor`), is not in Git (`*.pt` files are ignored): copy it into the project folder before the first run. The program never downloads it.
+The trained model, `PavoWeights.pt` (about 5 MB, one class: `Drone-Interceptor`), is in Git, so a fresh clone already has it (other `*.pt` files are ignored). The program never downloads a model.
 
 ## Running
 
@@ -277,4 +277,4 @@ To compare settings fairly, record a few clips with `record.py` and run each set
 | `requirements.txt` | Python packages with tested versions |
 | `NOTES.md` | Development notes and answers for each milestone |
 | `calibration.json` | Saved calibration (created by pressing `c`; not in Git) |
-| `PavoWeights.pt` | The trained drone model (copy it in; not in Git) |
+| `PavoWeights.pt` | The trained drone model |

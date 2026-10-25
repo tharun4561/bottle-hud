@@ -1,6 +1,8 @@
 .venv/
 __pycache__/
 *.pt
+# ...except the trained drone model, so a fresh clone can run.
+!PavoWeights.pt
 *.mp4
 calibration.json
 demo_error.log
